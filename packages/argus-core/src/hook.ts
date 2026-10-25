@@ -72,6 +72,10 @@ export async function runHook(
       resolve(stdout);
     });
 
+    // A hook may exit before consuming stdin (e.g. it ignores the context
+    // envelope) — the resulting EPIPE is expected, not an error. The
+    // child's exit status is reported by the `close` handler above.
+    child.stdin.on("error", () => {});
     child.stdin.write(JSON.stringify(input));
     child.stdin.end();
   });

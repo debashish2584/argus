@@ -57,7 +57,7 @@ export interface BugRecord {
   plan_id: string;
   title: string;
   severity: string;
-  status: "new" | "confirmed" | "fixed" | "dismissed";
+  status: "new" | "confirmed" | "unverified" | "fixed" | "dismissed";
   tracker_ref?: string;
   created_at: string;
 }
