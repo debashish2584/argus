@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local state & execution artifacts (test plans stay tracked)
+.argus/runs/
+.argus/state/
+.argus/secrets/
+
+# Playwright
+playwright-report/
+test-results/
+blob-report/
+
+# Misc
+.DS_Store
+*.log
