@@ -32,7 +32,7 @@ Ship a working default for every dimension; users override progressively.
 | `testplan` | 2 | impact report, specs, existing plans | `.argus/testplans/` (staging) | `fs_write: .argus/testplans/**` only | may not modify `ACTIVE` plans; new plans land as `DRAFT` |
 | `execute` | 3 | plans, env (service URLs) | run artifacts (video/trace/HAR/console) | browser + `net: target URLs only` | deterministic a11y path; LLM escalation only if `--vision` |
 | `triage` | 4 | run artifacts, state history, app logs | bug reports, tracker issues | `fs_read`, app-log access | runs **serially** (cross-run correlation) |
-| `fixer` | 5 | bug report, source, target repo's standards doc | application source on `fix/argus-<bug>` branch | `fs_write` allowlist, `shell` allowlist (build/test) | **cannot write**: `.argus/**`, test files, specs, contracts, `package*.json`, lockfiles, CI config — enforced at fs layer, not by prompt |
+| `fixer` | 5 | bug report, source, target repo's standards doc | application source on `argus/<bug>` branch | `fs_write` allowlist, `shell` allowlist (build/test) | **cannot write**: `.argus/**`, test files, specs, contracts, `package*.json`, lockfiles, CI config — enforced at fs layer, not by prompt |
 | `submit` | 6 | verified fix + evidence | commit, PR | `git push` (branch only), tracker API | **never** pushes to `main`/protected branches |
 
 ## 3. Configuration Schema
@@ -161,7 +161,7 @@ Notion, or an internal doc store one script away.
 4. **Respect the target.** Before fixing, the fixer ingests the target repo's
    engineering-standards document (e.g. `docs/agent-context.md`) as mandatory
    context — the tool follows the repository's own rules.
-5. **Branch-only writes.** `submit` may push `fix/argus-*` branches only;
+5. **Branch-only writes.** `submit` may push `argus/*` branches only;
    PRs are the sole path to main.
 
 ## 7. Observability & Reproducibility
@@ -185,3 +185,28 @@ the content of the PR.
 - Parallel fan-out, sandboxes, and pools are deliberately **out of MVP scope** —
   see [Post-MVP Roadmap](./post-mvp-roadmap.md). The orchestration code is
   written so that `fan_out` becomes a configuration concern, not a rewrite.
+
+## 9. Execution Harness (Playwright)
+
+Stage 3 (`execute`) is deterministic and LLM-free: a Playwright harness
+interprets the plan's `steps` and writes evidence into the scenario sink.
+
+- **Accessibility-first locators.** Steps target by `role`/`name`/`testid`/
+  `text` (resolved against the a11y tree); raw `css` is a last-resort escape
+  hatch. The `testplan` prompt is written to emit a11y locators.
+- **Stop at the first failure.** The failing step is recorded with its error;
+  later steps are marked `skipped`. One failure per scenario keeps triage
+  unambiguous — "where did it break" must not need interpretation.
+- **Evidence always.** Every scenario captures, in its sink dir:
+  `video.webm`, `trace.zip` (with screenshots), `network.har` (HAR 1.2),
+  `console.log`, and a final `screenshot.png` — plus `fail-<step>.png` at the
+  failing step. Video/trace/HAR capture can each be disabled in the harness
+  options; redaction runs over console + network text before it hits disk, and
+  sensitive response headers (`set-cookie`, `cookie`, `authorization`) are
+  masked inside the HAR.
+- **URLs are rendered, never baked.** Step URLs may use `{{VAR}}` service-map
+  refs; they are rendered against the run's env. A plan referencing an
+  undefined variable is a configuration defect and fails **before** the
+  browser launches — it is not executed and then triaged as an app bug.
+- **One browser per scenario.** Isolation is worth the launch cost in a
+  sequential MVP; per-scenario video/trace capture relies on it.

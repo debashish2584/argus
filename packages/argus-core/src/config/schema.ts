@@ -165,6 +165,8 @@ export const PlanStepSchema = z.discriminatedUnion("action", [
   assertStep,
 ]);
 export type PlanStep = z.infer<typeof PlanStepSchema>;
+/** The shape you *write* (defaults not yet applied); `PlanStep` is the parsed result. */
+export type PlanStepInput = z.input<typeof PlanStepSchema>;
 
 /**
  * A machine-executable test plan. Plans are Markdown files with YAML

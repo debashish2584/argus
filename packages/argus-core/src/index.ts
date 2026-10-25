@@ -17,6 +17,7 @@ export * from "./adapters/spec-source.js";
 export * from "./agent/runner.js";
 export * from "./plan/store.js";
 export * from "./execute/types.js";
+export * from "./execute/playwright.js";
 export * from "./agents/analyze.js";
 export * from "./agents/testplan.js";
 export * from "./agents/triage.js";
