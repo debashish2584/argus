@@ -12,8 +12,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "npm run build --workspace @argus/core && npm run build --workspace @argus/cli",
-    "test": "npm run build --workspace @argus/core && npm run test --workspaces --if-present",
+    "build": "npm run build --workspace @argus/core && npm run build --workspace @argus/studio && npm run build --workspace @argus/cli",
+    "test": "npm run build --workspace @argus/core && npm run build --workspace @argus/studio && npm run test --workspaces --if-present",
     "dogfood": "node dogfood/run.mjs",
     "dogfood:test": "node dogfood/selftest.mjs"
   }

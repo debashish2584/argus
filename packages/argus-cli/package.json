@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@argus/core": "*",
+    "@argus/studio": "*",
     "commander": "^13.1.0"
   },
   "devDependencies": {
