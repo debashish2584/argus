@@ -20,6 +20,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      # The core test suite includes real-browser harness tests.
+      - run: npx playwright install --with-deps chromium
       # Workspaces: core builds first (CLI typechecks @argus/core from dist).
       - run: npm run build --workspace @argus/core
       - run: npm run test
