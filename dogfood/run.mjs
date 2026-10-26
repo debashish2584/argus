@@ -1,0 +1,413 @@
+#!/usr/bin/env node
+/**
+ * Hermetic Argus dogfood (chunk D).
+ *
+ * Drives the full closed loop (`argus heal`) against the seeded SampleApp
+ * with a scripted OpenAI-compatible LLM — no real model, no real secrets,
+ * no network beyond 127.0.0.1:
+ *
+ *   1. build (if needed)          npm run build
+ *   2. start scripted-llm         :4321  (POST /v1/chat/completions)
+ *   3. start sample-app           :4173  (static, seeded bugs)
+ *   4. stage a fresh git target   copy sample-app → temp, git init, commit
+ *   5. write .argus/config.yaml   gates.testplan=auto, diff.base=main,
+ *                                 scripted LLM, no GitHub token → PRs local
+ *   6. argus heal --repo <temp>   all six stages
+ *   7. assert the acceptance bar  ≥4/5 seeded bugs found+fixed, control green
+ *   8. write a run report         dogfood/reports/dogfood-<ts>.md
+ *
+ * Usage: node dogfood/run.mjs [--keep]
+ * Exit 0 = acceptance bar met, 1 = not met (CI gate).
+ */
+import { spawn, spawnSync } from "node:child_process";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const argusRoot = path.resolve(here, "..");
+const cliBin = path.join(argusRoot, "packages", "argus-cli", "dist", "bin.js");
+const keep = process.argv.includes("--keep");
+
+const LLM_PORT = Number(process.env.DOGFOOD_LLM_PORT ?? 4321);
+const APP_PORT = Number(process.env.DOGFOOD_APP_PORT ?? 4173);
+
+const children = [];
+const failures = [];
+
+function step(name) {
+  console.log(`\n━━ dogfood: ${name} `.padEnd(60, "─"));
+}
+
+function fail(msg) {
+  failures.push(msg);
+  console.error(`✗ ${msg}`);
+}
+
+function git(cwd, ...args) {
+  const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed:\n${r.stderr}`);
+  return (r.stdout ?? "").trim();
+}
+
+function parseJsonl(file) {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+async function waitFor(url, what, timeoutMs = 20_000) {
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(1_000) });
+      if (res.ok) {
+        console.log(`  ✓ ${what} ready`);
+        return;
+      }
+    } catch {
+      // not up yet
+    }
+    if (Date.now() - t0 > timeoutMs) throw new Error(`${what} not ready within ${timeoutMs}ms`);
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+function startServer(script, port, name, extraEnv = {}) {
+  const child = spawn(process.execPath, [script], {
+    env: { ...process.env, PORT: String(port), ...extraEnv },
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  children.push(child);
+  return child;
+}
+
+/* ------------------------------------------------------------------ */
+/* main                                                                 */
+/* ------------------------------------------------------------------ */
+
+let targetDir = null;
+
+try {
+  /* 1. build */
+  step("build");
+  if (!existsSync(cliBin)) {
+    console.log("  dist missing — running npm run build…");
+    const r = spawnSync("npm", ["run", "build"], { cwd: argusRoot, stdio: "inherit" });
+    if (r.status !== 0) throw new Error("build failed");
+  } else {
+    console.log("  ✓ dist present");
+  }
+
+  /* 2. fresh git target (before the app server, which serves this copy) */
+  step("target repo");
+  const tmpBase = existsSync("/tmp/opencode") ? "/tmp/opencode" : os.tmpdir();
+  targetDir = mkdtempSync(path.join(tmpBase, "argus-dogfood-"));
+  cpSync(path.join(here, "sample-app"), targetDir, { recursive: true });
+  git(targetDir, "init", "-b", "main");
+  git(targetDir, "config", "user.name", "Argus Dogfood");
+  git(targetDir, "config", "user.email", "dogfood@argus.local");
+  git(targetDir, "add", "-A");
+  git(targetDir, "commit", "-q", "-m", "sample-app: base with seeded bugs");
+  const baseSha = git(targetDir, "rev-parse", "HEAD");
+  console.log(`  ✓ target at ${targetDir} (base ${baseSha.slice(0, 7)})`);
+
+  /* 3. servers — the app server serves the *target* copy so applied fixes
+     are what the verification re-runs actually see. */
+  step("servers");
+  startServer(path.join(here, "scripted-llm.mjs"), LLM_PORT, "scripted-llm");
+  startServer(
+    path.join(here, "sample-app", "server.mjs"),
+    APP_PORT,
+    "sample-app",
+    { PUBLIC_DIR: path.join(targetDir, "public") },
+  );
+  await waitFor(`http://127.0.0.1:${LLM_PORT}/health`, "scripted-llm");
+  await waitFor(`http://127.0.0.1:${APP_PORT}/`, "sample-app");
+
+  /* 5. config */
+  const configYaml = `# Hermetic dogfood config — generated by dogfood/run.mjs, no real secrets.
+version: 1
+
+target:
+  repo: ${targetDir}
+  env:
+    APP_URL: "http://127.0.0.1:${APP_PORT}"
+  health:
+    - url: "{{APP_URL}}/"
+      expect: 200
+  standards_doc: docs/agent-context.md
+
+diff:
+  base: main
+
+llm:
+  provider: custom
+  base_url: "http://127.0.0.1:${LLM_PORT}/v1"
+  model: "scripted-qe/1"
+  api_key: "scripted"
+  max_tokens: 4096
+  timeout_ms: 30000
+
+agents: {}
+pipeline:
+  stages: [analyze, testplan, execute, triage, fixer, submit]
+  gates:
+    testplan: auto
+  on_failure: continue-to-triage
+
+report: {}
+redact:
+  patterns: []
+  env_secrets: []
+`;
+  mkdirSync(path.join(targetDir, ".argus"), { recursive: true });
+  writeFileSync(path.join(targetDir, ".argus", "config.yaml"), configYaml);
+  console.log("  ✓ .argus/config.yaml written");
+
+  /* 6. heal */
+  step("argus heal (closed loop)");
+  const env = { ...process.env, NO_COLOR: "1" };
+  delete env.ARGUS_GITHUB_TOKEN; // deterministic: PRs stay local
+  const r = spawnSync(process.execPath, [cliBin, "heal", "--repo", targetDir], {
+    cwd: argusRoot,
+    stdio: "inherit",
+    env,
+  });
+  if (r.status !== 0) fail(`argus heal exited with code ${r.status}`);
+
+  /* 7. acceptance bar */
+  step("acceptance bar");
+  const stateDir = path.join(targetDir, ".argus", "state");
+  const runs = parseJsonl(path.join(stateDir, "runs.jsonl"));
+  const stages = parseJsonl(path.join(stateDir, "stages.jsonl"));
+  const scenarios = parseJsonl(path.join(stateDir, "scenarios.jsonl"));
+  const bugs = parseJsonl(path.join(stateDir, "bugs.jsonl"));
+  const llmCalls = parseJsonl(path.join(stateDir, "llm-calls.jsonl"));
+  const runId = runs.at(-1)?.run_id ?? "(none)";
+  const runDir = path.join(targetDir, ".argus", "runs", runId);
+  const summary = existsSync(path.join(runDir, "summary.json"))
+    ? JSON.parse(readFileSync(path.join(runDir, "summary.json"), "utf8"))
+    : null;
+
+  const baseScenarios = scenarios.filter((s) => s.run_id === runId && !s.plan_id.endsWith("-verify"));
+  const verifyScenarios = scenarios.filter((s) => s.run_id === runId && s.plan_id.endsWith("-verify"));
+  const bugStatus = new Map();
+  for (const b of bugs.filter((b) => b.run_id === runId)) bugStatus.set(b.bug_id, b);
+  const found = [...bugStatus.values()];
+  const fixed = found.filter((b) => b.status === "fixed");
+  const control = baseScenarios.find((s) => s.plan_id === "TP-006");
+
+  const checks = [];
+  checks.push({
+    name: "run completed",
+    pass: runs.at(-1)?.status === "completed",
+    detail: `run ${runId}: ${runs.at(-1)?.status ?? "missing"}`,
+  });
+  checks.push({
+    name: "all 6 plans executed",
+    pass: baseScenarios.length === 6,
+    detail: `${baseScenarios.length} base scenarios (${baseScenarios.map((s) => `${s.plan_id}:${s.status}`).join(", ")})`,
+  });
+  checks.push({
+    name: "≥4/5 seeded bugs detected",
+    pass: found.length >= 4,
+    detail: `${found.length} bugs: ${found.map((b) => b.bug_id).join(", ") || "none"}`,
+  });
+  checks.push({
+    name: "≥4/5 seeded bugs fixed & verified",
+    pass: fixed.length >= 4,
+    detail: `${fixed.length} fixed: ${fixed.map((b) => b.bug_id).join(", ") || "none"}`,
+  });
+  checks.push({
+    name: "passing control TP-006 stayed green",
+    pass: control?.status === "pass",
+    detail: control ? `TP-006: ${control.status}` : "TP-006 not found",
+  });
+  checks.push({
+    name: "verification re-runs passed",
+    pass:
+      verifyScenarios.length === fixed.length &&
+      verifyScenarios.every((s) => s.status === "pass"),
+    detail: verifyScenarios
+      .map((s) => `${s.plan_id}:${s.status}`)
+      .join(", ") || "no verification runs",
+  });
+
+  // evidence + local PR checks for every fixed bug
+  let evidenceOk = true;
+  let prOk = true;
+  const evidenceFiles = ["video.webm", "trace.zip", "network.har", "console.log", "screenshot.png"];
+  for (const b of fixed) {
+    const planId = b.plan_id;
+    const verifyDir = path.join(runDir, "scenarios", `${planId}-verify`);
+    for (const f of evidenceFiles) {
+      if (!existsSync(path.join(verifyDir, f))) {
+        evidenceOk = false;
+        break;
+      }
+    }
+    const prFile = path.join(runDir, "bugs", b.bug_id, "pull-request.json");
+    const pr = existsSync(prFile) ? JSON.parse(readFileSync(prFile, "utf8")) : null;
+    if (!pr || pr.status !== "pending-local") {
+      prOk = false;
+      continue;
+    }
+    try {
+      git(targetDir, "rev-parse", "--verify", pr.branch);
+    } catch {
+      prOk = false;
+    }
+  }
+  checks.push({
+    name: "evidence captured per fixed bug (video/trace/HAR/console/screenshot)",
+    pass: fixed.length > 0 && evidenceOk,
+    detail: evidenceFiles.join(", "),
+  });
+  checks.push({
+    name: "PR content staged locally per fix (no token → pending-local)",
+    pass: fixed.length > 0 && prOk,
+    detail: fixed.map((b) => `argus/${b.bug_id}`).join(", "),
+  });
+  checks.push({
+    name: "LLM calls recorded (reproducible runs)",
+    pass: llmCalls.filter((c) => c.run_id === runId).length >= 15,
+    detail: `${llmCalls.filter((c) => c.run_id === runId).length} calls in this run`,
+  });
+
+  for (const c of checks) {
+    console.log(`  ${c.pass ? "✓" : "✗"} ${c.name} — ${c.detail}`);
+    if (!c.pass) fail(`${c.name}: ${c.detail}`);
+  }
+
+  /* 8. report */
+  step("report");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  const reportDir = path.join(here, "reports");
+  mkdirSync(reportDir, { recursive: true });
+  const reportPath = path.join(reportDir, `dogfood-${stamp}.md`);
+
+  const stageLines = stages
+    .filter((s) => s.run_id === runId)
+    .map((s) => `| ${s.stage} | ${s.status} | ${s.duration_ms ?? "?"}ms | ${s.detail ?? ""} |`)
+    .join("\n");
+  const scenarioLines = baseScenarios
+    .map(
+      (s) =>
+        `| ${s.plan_id} | ${s.status} | ${s.failed_step_id ?? "—"} | ${s.duration_ms}ms | ${s.error?.slice(0, 80) ?? "—"} |`,
+    )
+    .join("\n");
+  const bugLines = found
+    .map(
+      (b) =>
+        `| ${b.bug_id} | ${b.severity} | ${b.plan_id} | ${b.title} | ${b.status} | argus/${b.bug_id} |`,
+    )
+    .join("\n");
+  const llm = llmCalls.filter((c) => c.run_id === runId);
+  const tokensIn = llm.reduce((n, c) => n + (c.prompt_tokens ?? 0), 0);
+  const tokensOut = llm.reduce((n, c) => n + (c.completion_tokens ?? 0), 0);
+
+  const verdict = checks.every((c) => c.pass) ? "PASS" : "FAIL";
+  writeFileSync(
+    reportPath,
+    [
+      `# Argus dogfood report — ${stamp}`,
+      ``,
+      `**Verdict: ${verdict}** — acceptance bar: ≥4/5 seeded bugs detected and fixed with a local PR;`,
+      `passing control stays green.`,
+      ``,
+      `- Run: \`${runId}\`` + (summary ? ` (summary: ${summary.status})` : ""),
+      `- Target: fresh git copy of \`dogfood/sample-app\` at \`${targetDir}\` (base \`${baseSha.slice(0, 7)}\`)`,
+      `- LLM: scripted OpenAI-compatible endpoint on 127.0.0.1:${LLM_PORT} (model \`scripted-qe/1\`)`,
+      `- App: SampleApp static server on 127.0.0.1:${APP_PORT} (5 seeded bugs)`,
+      `- GitHub: no token → PRs staged locally (\`pending-local\`), as documented`,
+      ``,
+      `## Acceptance bar`,
+      ``,
+      ...checks.map((c) => `- ${c.pass ? "✅" : "❌"} **${c.name}** — ${c.detail}`),
+      ``,
+      `## Stages`,
+      ``,
+      `| stage | status | duration | detail |`,
+      `|-------|--------|----------|--------|`,
+      stageLines,
+      ``,
+      `## Scenarios (base run)`,
+      ``,
+      `| plan | status | failed step | duration | error |`,
+      `|------|--------|-------------|----------|-------|`,
+      scenarioLines,
+      ``,
+      `## Bugs`,
+      ``,
+      `| bug | severity | plan | title | final status | fix branch |`,
+      `|-----|----------|------|-------|--------------|------------|`,
+      bugLines,
+      ``,
+      `## LLM telemetry`,
+      ``,
+      `- calls: ${llm.length} (analyze 1, testplan 1, triage ${found.length}, fixer ${found.length}, submit ${fixed.length})`,
+      `- tokens: ${tokensIn} in / ${tokensOut} out`,
+      ``,
+      `## Artifacts`,
+      ``,
+      `- run directory: \`${runDir}\`` + (keep ? "" : ` (temp dir removed after this run; rerun with \`--keep\` to inspect)`),
+      `- per-scenario evidence: \`video.webm\`, \`trace.zip\`, \`network.har\`, \`console.log\`, \`screenshot.png\` under \`scenarios/<plan>/\``,
+      `- per-bug: \`bug-report.json\`, \`pull-request.json\`, verify scenario under \`scenarios/<plan>-verify/\``,
+      ``,
+      `## Reproduce`,
+      ``,
+      "```sh",
+      `node dogfood/run.mjs            # hermetic closed loop, exit 0 = acceptance bar met`,
+      `node dogfood/run.mjs --keep     # keep the temp target for inspection`,
+      "```",
+      ``,
+    ].join("\n"),
+  );
+  console.log(`  ✓ report: ${reportPath}`);
+  console.log(`\n  VERDICT: ${verdict}`);
+} catch (e) {
+  fail(`dogfood crashed: ${e.message}`);
+} finally {
+  if (targetDir) {
+    try {
+      git(targetDir, "checkout", "main");
+    } catch {
+      // best effort
+    }
+  }
+  for (const c of children) {
+    try {
+      c.kill();
+    } catch {
+      // already dead
+    }
+  }
+  if (targetDir && !keep) {
+    rmSync(targetDir, { recursive: true, force: true });
+  } else if (targetDir && keep) {
+    console.log(`\n  kept target for inspection: ${targetDir}`);
+  }
+}
+
+process.exit(failures.length === 0 ? 0 : 1);

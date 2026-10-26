@@ -50,24 +50,56 @@ creates verified fixes, and submits pull requests for human sign-off.
 
 ```
 argus/
+├── .github/workflows/     # CI: tests + hermetic dogfood gate
 ├── docs/                  # specifications, architecture, roadmap
 ├── packages/
 │   ├── argus-core/        # agent runtime, adapters, storage, harness
 │   └── argus-cli/         # the `argus` command
-├── dogfood/               # self-contained sample app with seeded bugs
+├── dogfood/               # hermetic closed-loop harness (sample app + scripted LLM)
 ├── LICENSE                # Apache-2.0
 └── README.md
 ```
 
-## Development
+## Quickstart
 
 Node.js ≥ 20, npm workspaces.
 
 ```sh
 npm install
 npm run build
-npm test
+npm test                      # unit + integration (both workspaces)
+npx playwright install chromium
 ```
+
+Point `argus` at a target repository that has a spec and a running app:
+
+```sh
+argus init --repo /path/to/target     # scaffold .argus/config.yaml
+# edit .argus/config.yaml: llm provider/base_url/model, target.env, …
+
+argus plan  --repo /path/to/target     # analyze the diff → draft test plans
+argus run   --repo /path/to/target     # execute plans → triage failures
+argus heal  --repo /path/to/target     # full loop: … → fix → verify → PR
+```
+
+`plan`/`run`/`heal` are slices of the same six-stage pipeline — see
+[docs/agent-architecture-and-configuration.md](./docs/agent-architecture-and-configuration.md)
+for the agent model, config reference, and gate semantics. PRs are opened only
+when `ARGUS_GITHUB_TOKEN` is set; otherwise verified fixes are staged locally
+on `argus/BUG-NNN` branches with a `pending-local` PR record.
+
+## Hermetic dogfood
+
+`dogfood/` drives the full closed loop against a seeded sample app with a
+scripted LLM — no keys, no network beyond `127.0.0.1`:
+
+```sh
+node dogfood/selftest.mjs     # fast harness self-test (no browser)
+node dogfood/run.mjs          # full closed loop; exit 0 = acceptance bar met
+```
+
+This is also the CI gate (`.github/workflows/ci.yml`); each run writes a
+report to `dogfood/reports/`. See [dogfood/README.md](./dogfood/README.md).
 
 ## License
 
