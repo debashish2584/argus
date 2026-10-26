@@ -34,6 +34,10 @@ describe("JsonlStateStore", () => {
     expect(tp1).toHaveLength(2);
     expect(tp1[0]!.status).toBe("pass");
     expect(s.scenariosForPlan("TP-002")).toHaveLength(1);
+    // Same records addressable by run id (execution order preserved).
+    const run1 = s.scenariosForRun("run-1");
+    expect(run1.map((x) => x.plan_id)).toEqual(["TP-001", "TP-002", "TP-001"]);
+    expect(s.scenariosForRun("run-other")).toEqual([]);
   });
 
   it("records runs and returns the most recent", () => {

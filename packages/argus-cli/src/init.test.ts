@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { loadConfig } from "@argus/core";
 import { initConfig, renderConfig } from "./init.js";
 
 let dir: string;
@@ -43,5 +44,28 @@ describe("initConfig", () => {
     expect(() => renderConfig({ env: ["JUST_A_NAME"] }, "/x")).toThrowError(
       /invalid env pair/,
     );
+  });
+
+  it("scaffolded config passes loadConfig (stage names, gates, schema)", () => {
+    const prev = process.env["ARGUS_LLM_KEY"];
+    process.env["ARGUS_LLM_KEY"] = "test-key";
+    try {
+      initConfig(dir, { repo: dir });
+      const { config } = loadConfig(dir);
+      // Regression: the template once listed stage `fix`; the pipeline's
+      // stage vocabulary is `fixer` and the schema rejects unknown stages.
+      expect(config.pipeline.stages).toEqual([
+        "analyze",
+        "testplan",
+        "execute",
+        "triage",
+        "fixer",
+        "submit",
+      ]);
+      expect(config.pipeline.gates["testplan"]).toBe("human");
+    } finally {
+      if (prev === undefined) delete process.env["ARGUS_LLM_KEY"];
+      else process.env["ARGUS_LLM_KEY"] = prev;
+    }
   });
 });

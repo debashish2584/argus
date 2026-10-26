@@ -218,6 +218,7 @@ async function runPipeline(
   repo: string,
   autoApprove = true,
   executor: Executor = new ScriptedExecutor(),
+  plans?: string[],
 ) {
   const cfg = config(repo);
   const state = new JsonlStateStore(path.join(repo, ".argus", "state"));
@@ -243,7 +244,7 @@ async function runPipeline(
       redactor: new Redactor(),
       log: () => {},
     },
-    { executor, github: null, autoApprove },
+    { executor, github: null, autoApprove, plans },
   );
   const summary = await pipeline.run();
   return { cfg, state, runId, artifacts, executor, summary };
@@ -356,6 +357,54 @@ describe("Pipeline (closed loop, hermetic)", () => {
         .lastRuns(1)[0]
         ?.stages ?? [];
       expect(stages).toContain("triage");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("plans filter: executes only the requested plan ids, ignoring ACTIVE others", async () => {
+    const repo = makeRepo();
+    try {
+      // Two ACTIVE plans; the testplan stage will skip creating TP-001
+      // (id already known) so the store holds exactly TP-001 + TP-002.
+      const store = new PlanStore(path.join(repo, ".argus", "testplans"));
+      store.write({ ...PLAN, id: "TP-001" });
+      store.write({ ...PLAN, id: "TP-002", title: "other active plan" });
+
+      const executor = new ScriptedExecutor();
+      const { state, runId, summary } = await runPipeline(repo, true, executor, [
+        "TP-001",
+      ]);
+
+      expect(summary.status).toBe("completed");
+      expect(summary.plansExecuted).toBe(1);
+      // Only TP-001 was executed (and its verification re-run); the ACTIVE
+      // TP-002 never reached the browser.
+      expect(executor.calls).toEqual(["TP-001", "TP-001"]);
+      const scenarios = state.scenariosForRun(runId);
+      expect(scenarios.map((s) => s.plan_id)).toEqual([
+        "TP-001",
+        "TP-001-verify",
+      ]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("plans filter: unknown ids are a hard error before any stage work", async () => {
+    const repo = makeRepo();
+    try {
+      await expect(
+        runPipeline(repo, true, new ScriptedExecutor(), ["TP-999"]),
+      ).rejects.toThrow(/plan\(s\) not found: TP-999/);
+
+      // The run is recorded as failed; the execute stage never completed, so
+      // no scenario ran and no bug was triaged.
+      const state = new JsonlStateStore(path.join(repo, ".argus", "state"));
+      const recorded = state.lastRuns(1)[0];
+      expect(recorded?.status).toBe("failed");
+      expect(state.scenariosForRun(recorded!.run_id)).toEqual([]);
+      expect(state.bugs()).toEqual([]);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

@@ -40,9 +40,9 @@ llm:
 
 agents: {}
 pipeline:
-  stages: [analyze, testplan, execute, triage, fix, submit]
+  stages: [analyze, testplan, execute, triage, fixer, submit]
   gates:
-    after_testplan: human
+    testplan: human        # human (default) | auto | verify-then-pr
   on_failure: fail-fast
 
 report: {}

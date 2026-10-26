@@ -70,6 +70,11 @@ export interface PipelineDeps {
   github: GitHub | null;
   /** Bypass `human` gates (CI / --yes). */
   autoApprove?: boolean;
+  /**
+   * Restrict the execute stage to these plan ids (regardless of status).
+   * Unknown ids are a hard error. Used by `argus run --plan TP-001`.
+   */
+  plans?: string[];
 }
 
 export interface AppliedFix {
@@ -300,26 +305,54 @@ export class Pipeline {
               const dir = mkdir(artifacts.dir, "testplan");
               artifacts.writeJson(dir, "created.json", result);
               detail = `${result.created.length} plans created (DRAFT)`;
-              await confirmGate(
-                log,
-                "testplan",
-                `testplan produced:\n${result.created
-                  .map((c) => `  - ${c.id} ${c.title} (${c.file})`)
-                  .join("\n") || "  (no new plans)"}`,
-                this.deps.autoApprove,
-              );
+              // The testplan gate is human by default: plans are the fixer's
+              // ground truth, so a human signs off before execution. `auto`
+              // skips the prompt (CI); `verify-then-pr` defers approval to
+              // the PR review (the plan is still executed this run).
+              const gate = config.pipeline.gates["testplan"] ?? "human";
+              if (gate === "human") {
+                await confirmGate(
+                  log,
+                  "testplan",
+                  `testplan produced:\n${result.created
+                    .map((c) => `  - ${c.id} ${c.title} (${c.file})`)
+                    .join("\n") || "  (no new plans)"}`,
+                  this.deps.autoApprove,
+                );
+              } else {
+                log(`  gate testplan: ${gate} — no interactive prompt`);
+              }
               break;
             }
 
             case "execute": {
               await this.checkHealth();
               const all = planStore.list();
-              const plans = all.filter(
-                (p) => p.plan.status === "ACTIVE" || createdThisRun.has(p.plan.id),
-              );
+              const requested =
+                this.deps.plans && this.deps.plans.length > 0
+                  ? this.deps.plans
+                  : null;
+              const plans = requested
+                ? all.filter((p) => requested!.includes(p.plan.id))
+                : all.filter(
+                    (p) =>
+                      p.plan.status === "ACTIVE" || createdThisRun.has(p.plan.id),
+                  );
+              if (requested) {
+                const missing = requested.filter(
+                  (id) => !all.some((p) => p.plan.id === id),
+                );
+                if (missing.length > 0) {
+                  throw new PipelineError(
+                    `plan(s) not found: ${missing.join(", ")}`,
+                  );
+                }
+              }
               if (plans.length === 0) {
                 status = "skipped";
-                detail = "no ACTIVE plans and none created this run";
+                detail = requested
+                  ? "none of the requested plans matched"
+                  : "no ACTIVE plans and none created this run";
                 break;
               }
               log(`  executing ${plans.length} plan(s)…`);

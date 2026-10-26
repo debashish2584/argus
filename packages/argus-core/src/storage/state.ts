@@ -85,6 +85,8 @@ export interface StateStore {
   recordLlmCall(entry: LlmCallRecord): void;
   /** Full scenario history for a plan — the flakiness/regression signal. */
   scenariosForPlan(planId: string): ScenarioRecord[];
+  /** Scenario records for one run (newest last, in execution order). */
+  scenariosForRun(runId: string): ScenarioRecord[];
   lastRuns(limit: number): RunRecord[];
   bugs(): BugRecord[];
 }
@@ -152,6 +154,12 @@ export class JsonlStateStore implements StateStore {
   scenariosForPlan(planId: string): ScenarioRecord[] {
     return this.readAll<ScenarioRecord>("scenarios").filter(
       (s) => s.plan_id === planId,
+    );
+  }
+
+  scenariosForRun(runId: string): ScenarioRecord[] {
+    return this.readAll<ScenarioRecord>("scenarios").filter(
+      (s) => s.run_id === runId,
     );
   }
 

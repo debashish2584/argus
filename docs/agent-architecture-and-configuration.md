@@ -90,10 +90,9 @@ agents:
     limits: { timeout: 30m, retries: 1 }
 
 pipeline:
-  stages: [analyze, testplan, execute, triage, fix, submit]
+  stages: [analyze, testplan, execute, triage, fixer, submit]
   gates:
-    after_testplan: human     # auto | human (CLI prompt)
-    after_fix: verify-then-pr
+    testplan: human           # human (default) | auto | verify-then-pr
   on_failure: fail-fast       # fail-fast | continue-to-triage
 
 report:                       # global sinks; per-agent `report` overrides `on`/`to`
@@ -178,8 +177,12 @@ the content of the PR.
 ## 8. Pipeline Orchestration (MVP)
 
 - **Sequential** stages, each consuming the previous stage's on-disk output.
-- **Gates** between stages: `auto` or `human` (interactive CLI confirmation;
-  in CI, `human` gates become PR-based approval of the produced artifact).
+- **Gates**: `pipeline.gates.<stage>` = `auto | human | verify-then-pr`
+  (default `human` where a gate exists). MVP ships one gate — after
+  `testplan`, since plans are the fixer's ground truth: `human` prompts the
+  operator (abort on non-TTY unless `--yes`), `auto` skips it, and
+  `verify-then-pr` defers approval to PR review. PRs are opened **only after**
+  the verification re-run passes — enforced structurally, not by prompt.
 - **On-failure**: `fail-fast` (default) or `continue-to-triage` (collect all
   scenario results before triaging).
 - Parallel fan-out, sandboxes, and pools are deliberately **out of MVP scope** —
