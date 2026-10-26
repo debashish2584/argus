@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: typecheck + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # The core test suite includes real-browser harness tests.
+      - run: npx playwright install --with-deps chromium
+      # Workspaces: core builds first (CLI typechecks @argus/core from dist).
+      - run: npm run build --workspace @argus/core
+      - run: npm run test
+
+  dogfood:
+    name: hermetic dogfood (closed loop)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: harness self-test (fast, no browser needed)
+        run: node dogfood/selftest.mjs
+      - name: full hermetic closed loop (acceptance gate)
+        run: node dogfood/run.mjs
+      - name: publish run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dogfood-report
+          path: dogfood/reports/*.md
+          if-no-files-found: ignore
