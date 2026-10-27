@@ -399,6 +399,37 @@ table.tbl { border-collapse: collapse; width: 100%; font-size: 13px; }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
 .btn.ghost:hover { color: var(--text); background: var(--panel); }
 .btn.small { padding: 3px 9px; font-size: 12px; }
+.btn.danger { background: var(--red-soft); border-color: rgba(242, 112, 89, 0.5); color: var(--red); }
+.btn.danger:hover { filter: brightness(1.2); }
+.btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.btn:disabled:hover { filter: none; }
+
+/* pipeline trigger bar (project view) */
+.pipeline-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.pipeline-bar.active { border-color: rgba(86, 179, 196, 0.55); }
+.pipeline-bar .pdot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--teal);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.pipeline-bar .pstat { font-size: 13px; }
+.pipeline-bar .plog { font-size: 11px; color: var(--text-faint); }
+.pipeline-bar .btn.danger { margin-left: auto; }
+.chip.ok { color: var(--green); border-color: rgba(95, 211, 154, 0.4); }
+.chip.warn { color: var(--amber); border-color: rgba(242, 182, 75, 0.4); }
 
 /* ------------------------------------------------------------------ */
 /* run view                                                            */
@@ -672,6 +703,7 @@ details.diffbox pre { margin: 0; border: none; border-top: 1px solid var(--borde
 
 @media (prefers-reduced-motion: reduce) {
   .dot-pulse { animation: none; }
+  .pipeline-bar .pdot { animation: none; }
   a.card:hover { transform: none; }
 }
 

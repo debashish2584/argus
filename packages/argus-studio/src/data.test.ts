@@ -11,6 +11,7 @@ import {
   resolveEvidence,
   verdictFor,
   openBugCount,
+  planCoverage,
   type RunSummaryJson,
 } from "./data.js";
 import type { BugRecord, RunRecord } from "@argus/core";
@@ -276,5 +277,55 @@ describe("resolveEvidence", () => {
     const r = resolveEvidence(repoPath, runId, "TP-999", "screenshot.png");
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.code).toBe(404);
+  });
+});
+
+describe("planCoverage", () => {
+  let repoPath: string;
+  let runId: string;
+
+  const load = () => ({
+    runs: readState(repoPath).runs,
+    plans: readPlans(repoPath),
+  });
+
+  const setImpact = (affected: unknown) =>
+    writeFileSync(
+      path.join(repoPath, ".argus", "runs", runId, "analyze", "impact.json"),
+      JSON.stringify({ affected, test_focus: [] }),
+    );
+
+  beforeEach(() => {
+    const f = makeFixtureRepo(dir);
+    repoPath = f.repo;
+    runId = f.runId;
+  });
+
+  it("covers impacted modules that have an ACTIVE plan (legacy string shape)", () => {
+    // fixture impact is `affected: ["auth"]`; TP-001 (auth) is ACTIVE
+    const cov = planCoverage(repoPath, load().runs, load().plans);
+    expect(cov).not.toBeNull();
+    expect(cov!.run_id).toBe(runId); // uses the terminal run, not the running one
+    expect(cov!.modules).toBe(1);
+    expect(cov!.covered).toEqual(["auth"]);
+    expect(cov!.uncovered).toEqual([]);
+  });
+
+  it("flags impacted modules with no ACTIVE plan as uncovered (current shape)", () => {
+    setImpact([
+      { module: "auth", risk: "high" },
+      { module: "billing", risk: "medium" },
+    ]);
+    const cov = planCoverage(repoPath, load().runs, load().plans);
+    expect(cov).not.toBeNull();
+    expect(cov!.modules).toBe(2);
+    expect(cov!.covered).toEqual(["auth"]);
+    expect(cov!.uncovered).toEqual([{ module: "billing", risk: "medium" }]);
+  });
+
+  it("returns null when no analyze artifact exists", () => {
+    rmSync(path.join(repoPath, ".argus", "runs", runId, "analyze"), { recursive: true, force: true });
+    const cov = planCoverage(repoPath, load().runs, load().plans);
+    expect(cov).toBe(null);
   });
 });

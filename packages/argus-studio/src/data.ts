@@ -91,13 +91,29 @@ export interface ArgusState {
   llmCalls: LlmCallRecord[];
 }
 
+/**
+ * bugs.jsonl is append-only: every bug status change appends a fresh row
+ * for the same bug_id (triage → confirmed → fixed …). Collapse to one row
+ * per bug — latest status wins, first-appearance order — so counts, lists,
+ * and the verdict reflect the bug's CURRENT state, not its history.
+ */
+export function currentBugs(all: BugRecord[]): BugRecord[] {
+  const latest = new Map<string, BugRecord>();
+  const order: string[] = [];
+  for (const b of all) {
+    if (!latest.has(b.bug_id)) order.push(b.bug_id);
+    latest.set(b.bug_id, b);
+  }
+  return order.map((id) => latest.get(id)!);
+}
+
 export function readState(repoPath: string): ArgusState {
   const store = new JsonlStateStore(path.join(repoPath, ".argus", "state"));
   return {
     runs: store.lastRuns(1000),
     stages: readAll("stages"),
     scenarios: readAll("scenarios"),
-    bugs: store.bugs(),
+    bugs: currentBugs(store.bugs()),
     llmCalls: readAll("llm-calls"),
   };
   function readAll<T>(kind: string): T[] {
@@ -191,6 +207,49 @@ export function planHistories(repoPath: string): PlanHistory[] {
     });
   }
   return out.sort((a, b) => a.plan_id.localeCompare(b.plan_id));
+}
+
+/* ------------------------------------------------------------------ */
+/* plan coverage                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Coverage of the latest analyze impact by ACTIVE plans: which impacted
+ * modules have at least one ACTIVE plan, and which don't (the gap the
+ * dashboard surfaces beside the verdict — spec behavior no active plan
+ * exercises). Tolerates both impact shapes: the current
+ * `affected: [{module, risk}]` and the legacy `affected: ["module"]`.
+ */
+export interface CoverageReport {
+  run_id: string;
+  modules: number;
+  covered: string[];
+  uncovered: Array<{ module: string; risk: string }>;
+}
+
+export function planCoverage(
+  repoPath: string,
+  runs: RunRecord[],
+  plans: PlanInfo[],
+): CoverageReport | null {
+  const terminal = runs.filter((r) => r.status !== "running");
+  for (let i = terminal.length - 1; i >= 0; i--) {
+    const impact = readJsonSafe<{
+      affected?: Array<{ module?: string; risk?: string } | string>;
+    }>(path.join(repoPath, ".argus", "runs", terminal[i]!.run_id, "analyze", "impact.json"));
+    if (!impact?.affected?.length) continue;
+    const activeModules = new Set(plans.filter((p) => p.status === "ACTIVE").map((p) => p.module));
+    const mods = impact.affected.map((a) =>
+      typeof a === "string" ? { module: a, risk: "low" } : { module: a.module ?? "?", risk: a.risk ?? "low" },
+    );
+    return {
+      run_id: terminal[i]!.run_id,
+      modules: mods.length,
+      covered: mods.filter((m) => activeModules.has(m.module)).map((m) => m.module),
+      uncovered: mods.filter((m) => !activeModules.has(m.module)),
+    };
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ */

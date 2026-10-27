@@ -9,6 +9,7 @@
 
 const STAGES = ["analyze", "testplan", "execute", "triage", "fixer", "submit"];
 const POLL_MS = 4000;
+const OPEN_BUG = new Set(["new", "confirmed", "unverified"]);
 
 /* ------------------------------------------------------------------ */
 /* utils                                                               */
@@ -322,6 +323,47 @@ function renderBugsTable(scope = "project") {
   </div>`;
 }
 
+function pipelineBar() {
+  const p = app.project.project;
+  const act = app.project.active_run;
+  const latest = p.latest;
+  if (act) {
+    return `
+    <div class="pipeline-bar active" role="status">
+      <span class="pdot"></span>
+      <span class="pstat">${esc(act.action)} in progress · run <span class="mono">${esc(act.run_id)}</span>${act.source_run ? ` · fixing <span class="mono">${esc(act.source_run)}</span>` : ""}</span>
+      <span class="plog">pid ${act.pid} · ${relTime(act.started_at)}</span>
+      <button class="btn danger small" data-action="pipeline-stop">⏹ Stop</button>
+    </div>`;
+  }
+  const disabled = !p.exists;
+  const btn = (action, label, hint) =>
+    `<button class="btn" data-action="pipeline" data-pipeline="${action}" ${disabled ? "disabled" : ""} title="${esc(hint)}">${label}</button>`;
+  let fixBtn = "";
+  if (latest && latest.verdict !== "running") {
+    const open = (app.project.bugs ?? []).filter((b) => b.run_id === latest.run_id && OPEN_BUG.has(b.status));
+    if (open.length)
+      fixBtn = `<button class="btn danger" data-action="fix-run" data-run="${esc(latest.run_id)}" title="fixer + verify + PR for ${open.length} open bug${open.length === 1 ? "" : "s"} in ${esc(latest.run_id)} (P0–P2)">🔧 Fix + verify + PR</button>`;
+  }
+  return `
+  <div class="pipeline-bar">
+    ${btn("plan", "Plan", "analyze the diff, draft new test plans, and activate them")}
+    ${btn("run", "Run", "execute every ACTIVE plan + triage failures")}
+    ${btn("auto-run", "Auto-run", "Plan, then Run, in one go")}
+    ${fixBtn}
+    <span class="plog">triggers run the built argus CLI on this machine</span>
+  </div>`;
+}
+
+function coverageChip() {
+  const cov = app.project.coverage;
+  if (!cov) return "";
+  if (cov.uncovered.length === 0)
+    return `<span class="chip ok" title="every impacted module has an ACTIVE plan">coverage ${cov.modules}/${cov.modules}</span>`;
+  const list = cov.uncovered.map((u) => `${u.module} (${u.risk})`).join("\n");
+  return `<span class="chip warn" title="impacted modules with no ACTIVE plan:\n${esc(list)}">coverage ${cov.modules - cov.uncovered.length}/${cov.modules} · ${cov.uncovered.length} uncovered</span>`;
+}
+
 function renderProject() {
   const proj = app.project;
   const p = proj.project;
@@ -330,9 +372,12 @@ function renderProject() {
     <h1 class="view-title">${esc(p.name)}</h1>
     ${p.latest ? badge(p.latest.verdict) : `<span class="badge neutral">never run</span>`}
     ${p.open_bugs ? `<span class="chip sev-P1">${p.open_bugs} open bug${p.open_bugs === 1 ? "" : "s"}</span>` : ""}
+    ${coverageChip()}
     ${!p.exists ? `<span class="badge fail">path gone</span>` : ""}
   </div>
   <div class="view-sub">${esc(p.path)}${p.latest ? ` · head ${esc(shortSha(p.latest.head))} · ${p.runs_total} run${p.runs_total === 1 ? "" : "s"}` : ""}</div>
+
+  ${pipelineBar()}
 
   <div class="section">
     <div class="section-head">
@@ -440,10 +485,16 @@ function renderRun() {
   const s = r.summary;
   const llm = r.llm_totals;
   const runDur = r.run.ended_at ? new Date(r.run.ended_at).getTime() - new Date(r.run.started_at).getTime() : null;
+  const openHere = r.bugs.filter((b) => OPEN_BUG.has(b.status));
+  const fixBtn =
+    r.verdict !== "running" && openHere.length
+      ? `<button class="btn danger" data-action="fix-run" data-run="${esc(r.run.run_id)}" title="fixer + verify + PR for ${openHere.length} open bug${openHere.length === 1 ? "" : "s"} in this run (P0–P2)">🔧 Fix + verify + PR</button>`
+      : "";
   return `
   <div class="view-head">
     <h1 class="view-title mono" style="font-size:17px">${esc(r.run.run_id)} <button class="copy-btn" data-action="copy" data-text="${esc(r.run.run_id)}" title="copy run id">⧉</button></h1>
     ${badge(r.verdict)}
+    ${fixBtn}
   </div>
   <div class="view-sub">
     ${relTime(r.run.started_at)} · ${dur(runDur)} · head ${esc(shortSha(r.head))} · config ${esc(r.config_hash.slice(0, 8))}${r.argus_version ? ` · argus ${esc(r.argus_version)}` : ""}
@@ -699,6 +750,47 @@ document.addEventListener("click", (e) => {
   if (a === "run-filter") {
     app.runFilter = t.dataset.filter;
     render().catch(() => {});
+    return;
+  }
+  if (a === "pipeline") {
+    e.preventDefault();
+    const name = app.route.name;
+    const action = t.dataset.pipeline;
+    api("POST", `/api/projects/${encodeURIComponent(name)}/pipeline`, { action })
+      .then((r) => {
+        toast(`${action} started — run ${r.run_id}`);
+        render().catch(() => {});
+      })
+      .catch((err) => toast(err.message, true));
+    return;
+  }
+  if (a === "pipeline-stop") {
+    e.preventDefault();
+    api("POST", `/api/projects/${encodeURIComponent(app.route.name)}/pipeline/stop`)
+      .then((r) => {
+        toast(`stopped ${r.run_id}`);
+        render().catch(() => {});
+      })
+      .catch((err) => toast(err.message, true));
+    return;
+  }
+  if (a === "fix-run") {
+    e.preventDefault();
+    const runId = t.dataset.run;
+    if (
+      !confirm(
+        `Start the fixer on run ${runId}'s open bugs?\n\n` +
+          "The fixer edits code on a branch, re-runs the failed scenarios, " +
+          "and opens a PR for each verified fix (P0–P2).",
+      )
+    )
+      return;
+    api("POST", `/api/projects/${encodeURIComponent(app.route.name)}/runs/${encodeURIComponent(runId)}/fix`, {})
+      .then((r) => {
+        toast(`fix started — ${r.open_bugs} open bug${r.open_bugs === 1 ? "" : "s"} → run ${r.run_id}`);
+        render().catch(() => {});
+      })
+      .catch((err) => toast(err.message, true));
     return;
   }
   if (a === "bug-open") {
