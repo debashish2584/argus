@@ -32,7 +32,7 @@ import {
   inspect,
   allStages,
 } from "./pipeline.js";
-import { studioServe, studioAdd, studioRemove, studioList } from "./studio.js";
+import { studioServe, studioAdd, studioRemove, studioList, studioOpen } from "./studio.js";
 
 const VERSION = "0.1.0";
 
@@ -290,6 +290,23 @@ studio
   .action(async () => {
     try {
       await studioList();
+    } catch (e) {
+      console.error(`error: ${(e as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+studio
+  .command("open")
+  .description("ensure the dashboard server is running, then open it in the browser")
+  .action(async (_opts: unknown, cmd: Command) => {
+    try {
+      // Commander's default (non-positional) option parsing routes --port/--host
+      // to the parent `studio` command no matter where they appear on the line —
+      // `argus studio open --port N` and `argus studio --port N open` both land in
+      // the parent's opts — so the launcher reads them from the parent. Declaring
+      // them on `open` as well would shadow them silently (the parent wins).
+      await studioOpen({ ...(cmd.parent?.opts() ?? {}) });
     } catch (e) {
       console.error(`error: ${(e as Error).message}`);
       process.exitCode = 1;
