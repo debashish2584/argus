@@ -100,12 +100,15 @@ It's a read-only viewer: the `.argus/` workspace is the source of truth.
 
 ```sh
 argus studio                    # http://127.0.0.1:4900
+argus studio open               # launcher: start the server if it isn't running, then open the dashboard
 argus studio -P /path/to/repo   # one-off project (not persisted)
 argus studio add /path/to/repo  # register a project in the fleet
 ```
 
-See [docs/argus-studio.md](./docs/argus-studio.md) for the verdict model,
-API, registry format, and evidence-security notes.
+`argus studio open` is what a pinned taskbar/dock icon runs — the whole
+"click → dashboard" flow, idempotent and daemon-managed. See
+[docs/argus-studio.md](./docs/argus-studio.md) for the verdict model, API,
+registry format, evidence-security notes, and the native taskbar pin.
 
 ## Hermetic dogfood
 
