@@ -23,6 +23,7 @@ creates verified fixes, and submits pull requests for human sign-off.
 >
 > - 📄 [Architecture & Technical Specification](./docs/architecture-and-specification.md)
 > - 📄 [Agent Architecture & Configuration Model](./docs/agent-architecture-and-configuration.md)
+> - 📄 [Argus Studio — mission control dashboard](./docs/argus-studio.md)
 > - 📄 [Post-MVP Roadmap](./docs/post-mvp-roadmap.md) — sandbox pool, parallel
 >   execution, and vision are designed and deliberately out of MVP scope.
 
@@ -54,6 +55,7 @@ argus/
 ├── docs/                  # specifications, architecture, roadmap
 ├── packages/
 │   ├── argus-core/        # agent runtime, adapters, storage, harness
+│   ├── argus-studio/      # mission-control web dashboard (server + SPA)
 │   └── argus-cli/         # the `argus` command
 ├── dogfood/               # hermetic closed-loop harness (sample app + scripted LLM)
 ├── LICENSE                # Apache-2.0
@@ -87,6 +89,23 @@ argus heal  --repo /path/to/target     # full loop: … → fix → verify → P
 for the agent model, config reference, and gate semantics. PRs are opened only
 when `ARGUS_GITHUB_TOKEN` is set; otherwise verified fixes are staged locally
 on `argus/BUG-NNN` branches with a `pending-local` PR record.
+
+### Watching it work: Argus Studio
+
+Studio is a local mission-control dashboard over any number of target
+repositories — fleet cards with verdicts and sparklines, run history, a
+6-stage timeline per run, evidence lightbox (screenshots, video, HAR,
+console), per-plan flakiness history, and the full bug → fix → PR story.
+It's a read-only viewer: the `.argus/` workspace is the source of truth.
+
+```sh
+argus studio                    # http://127.0.0.1:4900
+argus studio -P /path/to/repo   # one-off project (not persisted)
+argus studio add /path/to/repo  # register a project in the fleet
+```
+
+See [docs/argus-studio.md](./docs/argus-studio.md) for the verdict model,
+API, registry format, and evidence-security notes.
 
 ## Hermetic dogfood
 

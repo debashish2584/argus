@@ -19,8 +19,9 @@
  * local `argus/BUG-NNN` branches with a staged (pending-local) PR record.
  */
 import { Command } from "commander";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { PROVIDER_PRESETS, loadConfig, type AgentId } from "@argus/core";
 import { initConfig } from "./init.js";
 import {
@@ -31,6 +32,7 @@ import {
   inspect,
   allStages,
 } from "./pipeline.js";
+import { studioServe, studioAdd, studioRemove, studioList } from "./studio.js";
 
 const VERSION = "0.1.0";
 
@@ -233,6 +235,67 @@ program
     }
   });
 
+// `studio` is a real subcommand tree: `argus studio [serve flags]` runs the
+// dashboard; `argus studio add/remove/list` manage the fleet registry.
+const studio = program
+  .command("studio")
+  .description("Argus Studio — mission control dashboard (runs, bugs, evidence)");
+studio
+  .option("--port <n>", "port (default 4900)")
+  .option("--host <h>", "host (default 127.0.0.1)")
+  .option("--open", "open a browser")
+  .option(
+    "-P, --project <dir>",
+    "one-off project (repeatable; not persisted)",
+    (v, prev: string[]) => [...(prev ?? []), v],
+    [] as string[],
+  )
+  .action(async (opts: { port?: string; host?: string; open?: boolean; project: string[] }) => {
+    try {
+      await studioServe(opts);
+    } catch (e) {
+      console.error(`error: ${(e as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+studio
+  .command("add <dir>")
+  .description("register a project with Argus Studio")
+  .option("--name <slug>", "project name (default: slug of the directory)")
+  .action(async (dir: string, opts: { name?: string }) => {
+    try {
+      await studioAdd(dir, opts.name);
+    } catch (e) {
+      console.error(`error: ${(e as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+studio
+  .command("remove <name>")
+  .description("unregister a project from Argus Studio")
+  .action(async (name: string) => {
+    try {
+      await studioRemove(name);
+    } catch (e) {
+      console.error(`error: ${(e as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+studio
+  .command("list")
+  .description("show projects registered with Argus Studio")
+  .action(async () => {
+    try {
+      await studioList();
+    } catch (e) {
+      console.error(`error: ${(e as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
 program
   .command("inspect")
   .description("print run/bug/scenario state")
@@ -292,7 +355,19 @@ async function run(cmd: string): Promise<{ status: number; stdout: string }> {
   }
 }
 
-program.parseAsync().catch((e: Error) => {
-  console.error(e.message);
-  process.exitCode = 1;
-});
+/** The fully-built command tree (exported for tests). */
+export function buildProgram(): Command {
+  return program;
+}
+
+// Only run the CLI when this file is the entry point — importing it (tests,
+// tooling) must not parse argv. realpath on both sides so symlinked bins
+// (node_modules/.bin/argus) still match.
+const entry = process.argv[1] ? realpathSync(process.argv[1]) : null;
+const isMain = entry !== null && entry === realpathSync(fileURLToPath(import.meta.url));
+if (isMain) {
+  buildProgram().parseAsync().catch((e: Error) => {
+    console.error(e.message);
+    process.exitCode = 1;
+  });
+}

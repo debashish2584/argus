@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Argus Studio</title>
+  <meta name="description" content="Mission control for Argus — runs, bugs, and evidence across your projects." />
+  <meta name="theme-color" content="#0b0f14" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/icons/icon-192.png" type="image/png" sizes="192x192" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="stylesheet" href="/studio.css" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="wordmark" href="#/">
+      <img src="/favicon.svg" alt="" width="22" height="22" />
+      <span>Argus<span class="wordmark-sub">Studio</span></span>
+    </a>
+    <nav class="crumbs" id="crumbs" aria-label="breadcrumb"></nav>
+    <div class="topbar-actions">
+      <button id="installBtn" class="btn ghost hidden" type="button" title="Install Argus Studio (pins to taskbar)">
+        ⬇ Install
+      </button>
+      <span class="server-chip" id="serverChip" title="studio server status"></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="rail" aria-label="projects">
+      <div class="rail-head">
+        <h2>Projects</h2>
+        <span class="rail-count" id="projectCount"></span>
+      </div>
+      <nav id="projectList" class="project-list"></nav>
+      <form id="addProjectForm" class="add-project" autocomplete="off">
+        <button type="button" id="addToggle" class="btn ghost small" aria-expanded="false">+ Add project</button>
+        <div id="addForm" class="hidden">
+          <input id="addPath" type="text" placeholder="/abs/path/to/repo-with-.argus" spellcheck="false" required />
+          <div class="add-row">
+            <input id="addName" type="text" placeholder="name" spellcheck="false" maxlength="64" required />
+            <button type="submit" class="btn small">Add</button>
+          </div>
+        </div>
+      </form>
+      <footer class="rail-foot">
+        <span class="dot dot-live" id="liveDot" title="live update state"></span>
+        <span id="liveLabel">live · 4s</span>
+      </footer>
+    </aside>
+
+    <main id="main" class="main" tabindex="-1">
+      <!-- views render here -->
+    </main>
+  </div>
+
+  <div id="drawer" class="drawer hidden" role="dialog" aria-modal="false" aria-label="bug detail">
+    <div class="drawer-bar">
+      <span id="drawerTitle"></span>
+      <button id="drawerClose" class="btn ghost small" type="button" aria-label="close">esc ✕</button>
+    </div>
+    <div id="drawerBody" class="drawer-body"></div>
+  </div>
+
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true" aria-label="evidence image">
+    <button class="lb-close" id="lbClose" type="button" aria-label="close">✕</button>
+    <img id="lbImg" alt="evidence screenshot" />
+    <div class="lb-caption" id="lbCaption"></div>
+  </div>
+
+  <template id="tpl-sparkline"></template>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
