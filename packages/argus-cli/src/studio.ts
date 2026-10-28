@@ -6,7 +6,7 @@
  * keeps studio code out of every other `argus` command's startup path.
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, openSync, closeSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, readlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export interface StudioServeOptions {
@@ -23,6 +23,9 @@ export async function studioServe(opts: StudioServeOptions): Promise<void> {
     host: opts.host,
     port: opts.port ? Number(opts.port) : undefined,
     oneOff: oneOffFromDirs(opts.project),
+    // console.log so the daemon (stdout → studio.log) and the foreground
+    // server log identically: startup, every trigger/stop, and 5xx errors.
+    log: (msg) => console.log(`[${new Date().toISOString()}] ${msg}`),
   });
   await server.start();
   const host = opts.host ?? "127.0.0.1";
@@ -72,13 +75,162 @@ export interface StudioOpenOptions {
   host?: string;
 }
 
+/** The subset of the `/api/health` response the launcher needs. */
+export interface HealthBody {
+  ok?: boolean;
+  version?: string;
+  /** Hash of the server runtime + served SPA (undefined on older builds). */
+  build_id?: string;
+  projects?: number;
+}
+
+export type LaunchDecision = "open" | "restart" | "start";
+
+/**
+ * What the launcher should do, given the running server's health response
+ * (or null when nothing healthy is on the port) and the installed build's
+ * fingerprint:
+ *
+ *   - `open`    — healthy and running the same build → just open the browser.
+ *   - `restart` — healthy but running a DIFFERENT build (or a pre-fingerprint
+ *                 build that reports no build id at all) → stop it and start a
+ *                 fresh server, so the UI and the API stay in lockstep.
+ *   - `start`   — nothing healthy on the port → start the server.
+ */
+export function decideLaunch(health: HealthBody | null, localBuildId: string | null): LaunchDecision {
+  if (!health || health.ok !== true) return "start";
+  if (!localBuildId) return "open"; // can't verify — leave the running server alone
+  return health.build_id === localBuildId ? "open" : "restart";
+}
+
+export async function getHealth(url: string): Promise<HealthBody | null> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return null;
+    return (await res.json()) as HealthBody;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stop whatever is serving the studio port so a fresh server can bind it.
+ *
+ * Order of operations: SIGTERM the pid from `home/studio.pid` (what the
+ * launcher itself writes); if the port is still live, fall back to finding
+ * the actual socket listener via /proc (covers a server started by hand,
+ * without a pid file) and SIGKILL it. Throws if the port stays occupied.
+ */
+export async function stopServer(port: number, home: string, host = "127.0.0.1"): Promise<void> {
+  const healthUrl = `http://${host}:${port}/api/health`;
+  const pidFile = path.join(home, "studio.pid");
+  const signaled: number[] = [];
+  try {
+    const t = readFileSync(pidFile, "utf8").trim();
+    if (/^\d+$/.test(t)) {
+      const pid = Number(t);
+      try {
+        process.kill(pid, "SIGTERM");
+        signaled.push(pid);
+      } catch {
+        // stale pid — already gone; skip the wait and go to the /proc scan
+      }
+    }
+  } catch {
+    // no pid file (or unreadable) — fall through to the /proc scan
+  }
+  if (signaled.length > 0 && await portFree(healthUrl, 5000)) return;
+
+  const listener = findPortListener(port);
+  if (listener) {
+    try {
+      process.kill(listener, "SIGKILL");
+    } catch {
+      // already gone
+    }
+    if (await portFree(healthUrl, 3000)) return;
+  }
+
+  throw new Error(
+    `port ${port} is still in use after stopping the old server ` +
+      `(tried pid ${signaled.length ? signaled.join(", ") : "n/a"}${listener ? ` and listener pid ${listener}` : ""})`,
+  );
+}
+
+async function portFree(healthUrl: string, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (!(await getHealth(healthUrl))) return true;
+    await sleep(150);
+  }
+  return !(await getHealth(healthUrl));
+}
+
+/**
+ * Find the pid listening on `port` by matching socket inodes in
+ * /proc/net/tcp{,6} against /proc/<pid>/fd links. Linux-only, best-effort:
+ * returns null when the platform or /proc doesn't allow it.
+ */
+export function findPortListener(port: number): number | null {
+  if (process.platform !== "linux") return null;
+  const inodes = new Set<string>();
+  for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of content.split("\n").slice(1)) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length < 10) continue;
+      // columns: sl local_address rem_address st … timeout inode
+      const localPort = cols[1]?.split(":")[1];
+      const inode = cols[9];
+      if (cols[3] === "0A" && localPort && inode && parseInt(localPort, 16) === port) inodes.add(inode);
+    }
+  }
+  if (inodes.size === 0) return null;
+  let pids: string[];
+  try {
+    pids = readdirSync("/proc").filter((d) => /^\d+$/.test(d));
+  } catch {
+    return null;
+  }
+  for (const pid of pids) {
+    let fds: string[];
+    try {
+      fds = readdirSync(`/proc/${pid}/fd`);
+    } catch {
+      continue; // no permission / gone
+    }
+    for (const fd of fds) {
+      let link = "";
+      try {
+        link = readlinkSync(`/proc/${pid}/fd/${fd}`);
+      } catch {
+        continue;
+      }
+      const m = link.match(/^socket:\[(\d+)\]$/);
+      if (m && m[1] && inodes.has(m[1])) return Number(pid);
+    }
+  }
+  return null;
+}
+
 /**
  * `argus studio open` — the launcher entry point (what a taskbar/desktop
- * icon runs). Ensures the dashboard server is running:
+ * icon runs). Ensures the dashboard server is running **and current**:
  *
- *   1. health-check the port; if already healthy, just open the browser.
- *   2. otherwise start the server as a detached daemon (log + pid under the
- *      studio home), wait until it is healthy (15 s budget), then open it.
+ *   1. health-check the port; if a healthy server answers, compare its
+ *      build id to the installed build. Same → just open the browser.
+ *      Different (or a pre-fingerprint server) → stop the old server and
+ *      start a fresh one, so the served UI and the API are in lockstep —
+ *      otherwise the SPA shows new features the in-memory server doesn't
+ *      have ("no such API route").
+ *   2. if nothing healthy is on the port, start the server as a detached
+ *      daemon (log + pid under the studio home), wait until it is healthy
+ *      (15 s budget), then open it.
  *
  * Idempotent — safe to invoke repeatedly (e.g. every time the icon is
  * clicked). A browser app can't start a local server, so this native
@@ -91,18 +243,39 @@ export async function studioOpen(opts: StudioOpenOptions): Promise<void> {
   const url = `http://${browserHost}:${port}`;
   const healthUrl = `${url}/api/health`;
 
-  if (await isHealthy(healthUrl)) {
-    console.log(`✓ Argus Studio is already running at ${url}`);
+  const { defaultRegistryPath, buildId } = await import("@argus/studio");
+  const home = path.dirname(defaultRegistryPath());
+  const localBuild = buildId();
+  const health = await getHealth(healthUrl);
+  const decision = decideLaunch(health, localBuild);
+
+  if (decision === "open") {
+    console.log(`✓ Argus Studio is already running at ${url} (build ${health!.build_id})`);
     openBrowser(url);
     return;
   }
+  if (decision === "restart") {
+    console.log(
+      `Argus Studio on :${port} is running stale code ` +
+        `(server build ${health!.build_id ?? "unknown"}, installed build ${localBuild}) — ` +
+        `restarting it to pick up the new build…`,
+    );
+    try {
+      await stopServer(port, home, browserHost);
+      console.log("  old server stopped.");
+    } catch (e) {
+      console.error(`✗ could not stop the running server: ${(e as Error).message}`);
+      console.error(`  stop it manually — e.g. kill $(cat ${path.join(home, "studio.pid")}) — and try again.`);
+      process.exitCode = 1;
+      return;
+    }
+  } else {
+    console.log("Argus Studio is not running — starting it…");
+  }
 
-  console.log("Argus Studio is not running — starting it…");
   const binPath = process.argv[1] ? path.resolve(process.argv[1]) : null;
   if (!binPath) throw new Error("could not resolve the argus bin path");
 
-  const { defaultRegistryPath } = await import("@argus/studio");
-  const home = path.dirname(defaultRegistryPath());
   mkdirSync(home, { recursive: true });
   const logFile = path.join(home, "studio.log");
   const pidFile = path.join(home, "studio.pid");
@@ -124,7 +297,7 @@ export async function studioOpen(opts: StudioOpenOptions): Promise<void> {
   const deadline = Date.now() + 15_000;
   let up = false;
   while (Date.now() < deadline) {
-    if (await isHealthy(healthUrl)) {
+    if ((await getHealth(healthUrl))?.ok) {
       up = true;
       break;
     }
@@ -142,21 +315,11 @@ export async function studioOpen(opts: StudioOpenOptions): Promise<void> {
     return;
   }
 
-  console.log(`✓ Argus Studio started at ${url}`);
+  const upHealth = await getHealth(healthUrl);
+  console.log(`✓ Argus Studio started at ${url} (build ${upHealth?.build_id ?? "n/a"})`);
   console.log(`  pid ${child.pid} (stop with: kill $(cat ${pidFile}))`);
-  console.log(`  log: ${logFile}`);
+  console.log(`  log: ${logFile} (server startup + every trigger/stop is logged there)`);
   openBrowser(url);
-}
-
-async function isHealthy(url: string): Promise<boolean> {
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
-    if (!res.ok) return false;
-    const body = (await res.json()) as { ok?: boolean };
-    return body.ok === true;
-  } catch {
-    return false;
-  }
 }
 
 function sleep(ms: number): Promise<void> {

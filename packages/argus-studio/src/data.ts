@@ -91,13 +91,29 @@ export interface ArgusState {
   llmCalls: LlmCallRecord[];
 }
 
+/**
+ * bugs.jsonl is append-only: every bug status change appends a fresh row
+ * for the same bug_id (triage → confirmed → fixed …). Collapse to one row
+ * per bug — latest status wins, first-appearance order — so counts, lists,
+ * and the verdict reflect the bug's CURRENT state, not its history.
+ */
+export function currentBugs(all: BugRecord[]): BugRecord[] {
+  const latest = new Map<string, BugRecord>();
+  const order: string[] = [];
+  for (const b of all) {
+    if (!latest.has(b.bug_id)) order.push(b.bug_id);
+    latest.set(b.bug_id, b);
+  }
+  return order.map((id) => latest.get(id)!);
+}
+
 export function readState(repoPath: string): ArgusState {
   const store = new JsonlStateStore(path.join(repoPath, ".argus", "state"));
   return {
     runs: store.lastRuns(1000),
     stages: readAll("stages"),
     scenarios: readAll("scenarios"),
-    bugs: store.bugs(),
+    bugs: currentBugs(store.bugs()),
     llmCalls: readAll("llm-calls"),
   };
   function readAll<T>(kind: string): T[] {
@@ -191,6 +207,49 @@ export function planHistories(repoPath: string): PlanHistory[] {
     });
   }
   return out.sort((a, b) => a.plan_id.localeCompare(b.plan_id));
+}
+
+/* ------------------------------------------------------------------ */
+/* plan coverage                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Coverage of the latest analyze impact by ACTIVE plans: which impacted
+ * modules have at least one ACTIVE plan, and which don't (the gap the
+ * dashboard surfaces beside the verdict — spec behavior no active plan
+ * exercises). Tolerates both impact shapes: the current
+ * `affected: [{module, risk}]` and the legacy `affected: ["module"]`.
+ */
+export interface CoverageReport {
+  run_id: string;
+  modules: number;
+  covered: string[];
+  uncovered: Array<{ module: string; risk: string }>;
+}
+
+export function planCoverage(
+  repoPath: string,
+  runs: RunRecord[],
+  plans: PlanInfo[],
+): CoverageReport | null {
+  const terminal = runs.filter((r) => r.status !== "running");
+  for (let i = terminal.length - 1; i >= 0; i--) {
+    const impact = readJsonSafe<{
+      affected?: Array<{ module?: string; risk?: string } | string>;
+    }>(path.join(repoPath, ".argus", "runs", terminal[i]!.run_id, "analyze", "impact.json"));
+    if (!impact?.affected?.length) continue;
+    const activeModules = new Set(plans.filter((p) => p.status === "ACTIVE").map((p) => p.module));
+    const mods = impact.affected.map((a) =>
+      typeof a === "string" ? { module: a, risk: "low" } : { module: a.module ?? "?", risk: a.risk ?? "low" },
+    );
+    return {
+      run_id: terminal[i]!.run_id,
+      modules: mods.length,
+      covered: mods.filter((m) => activeModules.has(m.module)).map((m) => m.module),
+      uncovered: mods.filter((m) => !activeModules.has(m.module)),
+    };
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -416,6 +475,118 @@ export function runDetail(repoPath: string, runId: string): RunDetail | null {
     head: runJson?.head ?? run.head,
     config_hash: runJson?.config_hash ?? run.config_hash,
     argus_version: runJson?.argus_version,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* run progress — for the in-flight pipeline bar                       */
+/* ------------------------------------------------------------------ */
+
+export type ProgressStageStatus = "pending" | "running" | "done" | "skipped";
+
+export interface ProgressStage {
+  name: string;
+  status: ProgressStageStatus;
+  duration_ms?: number;
+}
+
+export interface RunProgress {
+  run_id: string;
+  /** Run status: running | completed | failed | aborted | unknown. */
+  status: string;
+  started_at: string;
+  elapsed_ms: number;
+  /** The ordered stage track this action will run, with per-stage status. */
+  stages: ProgressStage[];
+  /** 0..1 — finished stages over the track length. */
+  progress: number;
+  /** Last N lines of the per-run trigger log (for the live "what's happening"). */
+  log_tail: string[];
+  log_file: string | null;
+}
+
+/** Tolerant one-file JSONL read (same shape as the state reader). */
+function readJsonl<T>(file: string): T[] {
+  if (!existsSync(file)) return [];
+  const out: T[] = [];
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      out.push(JSON.parse(t) as T);
+    } catch {
+      // corrupt / mid-write line — skip, never crash a progress poll
+    }
+  }
+  return out;
+}
+
+function readLogTail(file: string | null, n: number): string[] {
+  if (!file || !existsSync(file)) return [];
+  try {
+    const lines = readFileSync(file, "utf8").split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    return lines.slice(-n);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Progress snapshot for a run: the ordered stage track (from the run record —
+ * exactly the stages this action will run), which stages have finished (from
+ * the append-only stage records), and a tail of the trigger log. Light by
+ * design — it reads only `runs.jsonl` + `stages.jsonl` + the log file, so it
+ * is cheap enough for the 2 s progress poll.
+ */
+export function runProgress(
+  repoPath: string,
+  runId: string,
+  logFile: string | null,
+  lines = 30,
+): RunProgress {
+  const stateDir = path.join(repoPath, ".argus", "state");
+  const runs = readJsonl<RunRecord>(path.join(stateDir, "runs.jsonl")).filter(
+    (r) => r.run_id === runId,
+  );
+  const run = runs.at(-1) ?? null;
+  const track: string[] = run?.stages ?? [];
+  const done = new Map<string, { status: StageRecord["status"]; duration_ms?: number }>();
+  for (const s of readJsonl<StageRecord>(path.join(stateDir, "stages.jsonl")).filter(
+    (x) => x.run_id === runId,
+  )) {
+    done.set(s.stage, { status: s.status, duration_ms: s.duration_ms });
+  }
+
+  const status = run?.status ?? "unknown";
+  const isRunning = status === "running";
+  const firstOpen = track.findIndex((n) => !done.has(n));
+  const stages: ProgressStage[] = track.map((name, i) => {
+    const d = done.get(name);
+    if (d) {
+      return {
+        name,
+        status: d.status === "skipped" ? "skipped" : "done",
+        duration_ms: d.duration_ms,
+      };
+    }
+    return { name, status: isRunning && i === firstOpen ? "running" : "pending" };
+  });
+
+  const finished = stages.filter((s) => s.status === "done" || s.status === "skipped").length;
+  const progress = track.length ? finished / track.length : 0;
+  const startedAt = run?.started_at ?? "";
+  const elapsed_ms = startedAt ? Math.max(0, Date.now() - Date.parse(startedAt)) : 0;
+
+  return {
+    run_id: runId,
+    status,
+    started_at: startedAt,
+    elapsed_ms,
+    stages,
+    progress,
+    log_tail: readLogTail(logFile, lines),
+    log_file: logFile,
   };
 }
 

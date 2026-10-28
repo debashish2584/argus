@@ -96,7 +96,10 @@ Studio is a local mission-control dashboard over any number of target
 repositories — fleet cards with verdicts and sparklines, run history, a
 6-stage timeline per run, evidence lightbox (screenshots, video, HAR,
 console), per-plan flakiness history, and the full bug → fix → PR story.
-It's a read-only viewer: the `.argus/` workspace is the source of truth.
+The `.argus/` workspace is the source of truth; Studio renders it, and its
+pipeline bar (**Plan** / **Run** / **Auto-run**, plus an opt-in **🔧 Fix +
+verify + PR** on runs with open bugs) starts runs by spawning the `argus` CLI
+as a tracked child (one active run per project, loopback-only endpoints).
 
 ```sh
 argus studio                    # http://127.0.0.1:4900

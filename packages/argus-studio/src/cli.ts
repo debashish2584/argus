@@ -72,6 +72,8 @@ async function serve(flags: Flags): Promise<void> {
     host: flags.host,
     port: flags.port,
     oneOff: flags.oneOff,
+    // startup, every trigger/stop, and 5xx errors — timestamped to the console
+    log: (msg) => console.log(`[${new Date().toISOString()}] ${msg}`),
   });
   await server.start();
   const host = flags.host ?? "127.0.0.1";

@@ -17,6 +17,10 @@
  *    interactive confirmation unless autoApprove is set; `verify-then-pr`
  *    is enforced structurally — no PR is ever opened before the failed
  *    plan re-runs green in the fix stage's verification step.
+ *  - **Repair mode** (`repairRunId` in the context): run only the fixer +
+ *    submit stages against an *earlier* run's open bugs. This is what
+ *    `argus fix --run <id>` and the dashboard's "Fix + verify + PR" action
+ *    spawn — the fix stage stays opt-in; a normal run never fixes.
  *  - **Evidence everywhere.** Every stage writes its machine-readable
  *    output to the run artifact dir; every bug gets its own dir.
  */
@@ -57,6 +61,14 @@ export interface PipelineContext {
   runId: string;
   /** SHA the run started from (fix branches are cut from here). */
   baseHead: string;
+  /**
+   * Repair mode: the run whose OPEN bugs the fixer stage should address
+   * (instead of this run's freshly triaged ones). Used by `argus fix --run`
+   * and the dashboard's "Fix + verify + PR" action. Bug reports are read
+   * from that run's artifact dir; fix branches are still cut from THIS run's
+   * `baseHead` (the repo head at repair time, so fixes target current code).
+   */
+  repairRunId?: string;
   state: StateStore;
   artifacts: RunArtifacts;
   git: Git;
@@ -75,6 +87,11 @@ export interface PipelineDeps {
    * Unknown ids are a hard error. Used by `argus run --plan TP-001`.
    */
   plans?: string[];
+  /**
+   * Severities the fixer stage will address (default P0–P2; P3 is always
+   * left for humans). Used to scope the repair action, e.g. P0-only.
+   */
+  allowedSeverities?: string[];
 }
 
 export interface AppliedFix {
@@ -465,19 +482,35 @@ export class Pipeline {
             }
 
             case "fixer": {
-              const triaged = state.bugs().filter((b) => b.run_id === runId);
-              const fixable = triaged.filter((b) =>
-                ["P0-Blocker", "P1-High", "P2-Medium"].includes(b.severity),
-              );
+              const repairing = Boolean(this.ctx.repairRunId);
+              const srcRun = this.ctx.repairRunId ?? runId;
+              const triaged = state.bugs().filter((b) => b.run_id === srcRun);
+              const allowed =
+                this.deps.allowedSeverities ?? ["P0-Blocker", "P1-High", "P2-Medium"];
+              let fixable = triaged.filter((b) => allowed.includes(b.severity));
+              if (repairing) {
+                // Repair acts on OPEN bugs only — fixed/dismissed ones stay
+                // where the original run left them.
+                fixable = fixable.filter((b) =>
+                  ["new", "confirmed", "unverified"].includes(b.status),
+                );
+              }
               if (fixable.length === 0) {
                 status = failures.length === 0 ? "skipped" : "ok";
-                detail =
-                  failures.length === 0
+                detail = repairing
+                  ? `no open bugs in ${allowed.length} severity scope${triaged.length ? " (the rest are fixed/dismissed or P3)" : ""}`
+                  : failures.length === 0
                     ? "no bugs to fix"
                     : "no P0–P2 bugs to fix (P3s left for humans)";
                 break;
               }
-              await this.runFixLoop(fixable, failures, summary, agentCfg);
+              // Repair mode reconstructs the failing scenarios from the
+              // source run's state + artifacts (the in-memory `failures`
+              // list is only populated when execute ran in THIS run).
+              const fixFailures = repairing
+                ? this.rebuildFailures(srcRun, planStore, runId)
+                : failures;
+              await this.runFixLoop(fixable, fixFailures, summary, agentCfg);
               detail = `${summary.fixes.length}/${fixable.length} fixes verified`;
               break;
             }
@@ -605,6 +638,40 @@ export class Pipeline {
     }
   }
 
+  /**
+   * Repair mode: reconstruct `{plan, result}` pairs for a source run from
+   * its scenario records + on-disk result.json. Scenarios whose artifacts
+   * were cleaned are skipped (the affected bug then fails the fix loop
+   * with an honest "no failing plan recorded" error instead of crashing).
+   */
+  private rebuildFailures(
+    srcRun: string,
+    planStore: PlanStore,
+    runId: string,
+  ): Array<{ plan: TestPlan; result: ScenarioResult }> {
+    const out: Array<{ plan: TestPlan; result: ScenarioResult }> = [];
+    const plans = planStore.list();
+    for (const sc of this.ctx.state
+      .scenariosForRun(srcRun)
+      .filter((s) => s.status === "fail" || s.status === "error")) {
+      const pf = plans.find((p) => p.plan.id === sc.plan_id);
+      if (!pf) continue; // plan was removed since the source run
+      const resultFile = path.join(sc.artifacts_dir, "result.json");
+      if (!existsSync(resultFile)) continue; // artifacts were cleaned
+      let result: ScenarioResult;
+      try {
+        result = JSON.parse(readFileSync(resultFile, "utf8")) as ScenarioResult;
+      } catch {
+        continue; // corrupt result — skip
+      }
+      out.push({ plan: pf.plan, result });
+      this.ctx.log(
+        `  repair: loaded failing scenario ${sc.plan_id} from ${srcRun} (run ${runId})`,
+      );
+    }
+    return out;
+  }
+
   /** The failing step's definition, as the fixer's "definition of done". */
   private failingStepSpec(
     plan: TestPlan,
@@ -642,7 +709,7 @@ export class Pipeline {
         const failed = planById.get(bug.plan_id);
         if (!failed) throw new PipelineError(`no failing plan recorded for ${bug.plan_id}`);
         const plan = failed.plan;
-        const bugReport = this.readBugReport(bug.bug_id);
+        const bugReport = this.readBugReport(bug);
 
         // 2. Ask the fixer.
         const contextFiles = collectFixerContext(
@@ -736,8 +803,23 @@ export class Pipeline {
     return this.ctx.config.pipeline.on_failure === "continue-to-triage";
   }
 
-  private readBugReport(bugId: string): BugReport {
-    const file = path.join(this.ctx.artifacts.bugDir(bugId), "bug-report.json");
+  /**
+   * Bug reports live under the run that *produced* the bug — in repair
+   * mode that is the source run, not the current one. (Path computed
+   * directly so we don't construct a RunArtifacts — its constructor would
+   * re-write the source run's run.json manifest.)
+   */
+  private readBugReport(bug: BugRecord): BugReport {
+    const runId = bug.run_id === this.ctx.runId ? this.ctx.runId : bug.run_id;
+    const file = path.join(
+      this.ctx.repoRoot,
+      ".argus",
+      "runs",
+      runId,
+      "bugs",
+      bug.bug_id,
+      "bug-report.json",
+    );
     if (!existsSync(file)) {
       throw new PipelineError(`bug report artifact missing: ${file}`);
     }

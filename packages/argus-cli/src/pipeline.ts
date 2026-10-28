@@ -7,6 +7,7 @@
  *   argus plan   → analyze + testplan        (drafts plans from the diff)
  *   argus run    → execute + triage          (runs plans, reports failures)
  *   argus heal   → all six stages            (full closed loop: … → fix → PR)
+ *   argus fix    → fixer + submit            (repair an existing run's open bugs)
  *   argus triage → ad-hoc re-triage of an existing run's failures
  *   argus report → re-sends the email report for an existing run
  *   argus inspect→ prints run/bug/scenario state
@@ -56,6 +57,29 @@ export interface PipelineFlags {
   noVideo?: boolean;
   noTrace?: boolean;
   noHar?: boolean;
+  /**
+   * Explicit run id. The dashboard passes one (via `--run-id`) so it can
+   * track exactly which run it spawned — e.g. to mark it `aborted` when
+   * the operator stops the run.
+   */
+  runId?: string;
+  /** Repair mode: the run whose OPEN bugs the fixer stage addresses. */
+  repairRunId?: string;
+  /** Severities the fixer stage addresses (default P0–P2). */
+  allowedSeverities?: string[];
+  /** DRAFT → ACTIVE for the plans this run created (dashboard Plan button). */
+  activate?: boolean;
+}
+
+/** Valid severity ids (mirrors the triage schema enum). */
+export const SEVERITIES = ["P0-Blocker", "P1-High", "P2-Medium", "P3-Low"] as const;
+
+export function validateSeverities(sev: string[]): string[] {
+  const bad = sev.filter((s) => !(SEVERITIES as readonly string[]).includes(s));
+  if (bad.length > 0) {
+    throw new Error(`invalid severity '${bad[0]}' (expected: ${SEVERITIES.join(", ")})`);
+  }
+  return [...new Set(sev)];
 }
 
 /** GitHub token ref — PRs stay local when unset (documented, not an error). */
@@ -76,7 +100,7 @@ export async function executePipeline(
   const git = new Git(root);
   const baseHead = await git.head();
   const state = new JsonlStateStore(path.join(root, ".argus", "state"));
-  const runId = newRunId();
+  const runId = flags.runId ?? newRunId();
   const artifacts = new RunArtifacts(root, runId, {
     run_id: runId,
     started_at: new Date().toISOString(),
@@ -97,6 +121,7 @@ export async function executePipeline(
     repoRoot: root,
     runId,
     baseHead,
+    repairRunId: flags.repairRunId,
     state,
     artifacts,
     git,
@@ -114,11 +139,46 @@ export async function executePipeline(
     github: githubFromEnv(),
     autoApprove: flags.yes,
     plans: flags.plans,
+    allowedSeverities: flags.allowedSeverities,
   });
 
   const summary = await pipeline.run();
   printSummary(summary, artifacts.dir);
+  if (flags.activate) {
+    activateCreatedPlans(root, runId);
+  }
   return summary;
+}
+
+/**
+ * DRAFT → ACTIVE for every plan this run's testplan stage created (the
+ * dashboard's Plan button wants the new plans to actually run on the next
+ * Run — a draft is never executed). Plans that vanished or already had a
+ * different status are left alone; activation is best-effort and logged,
+ * never fatal.
+ */
+export function activateCreatedPlans(root: string, runId: string): number {
+  const createdFile = path.join(root, ".argus", "runs", runId, "testplan", "created.json");
+  if (!existsSync(createdFile)) return 0;
+  let created: { id: string }[];
+  try {
+    created = (JSON.parse(readFileSync(createdFile, "utf8")) as {
+      created?: { id: string }[];
+    }).created ?? [];
+  } catch {
+    return 0; // mid-write / corrupt — the run already finished, don't fail the command
+  }
+  const store = new PlanStore(path.join(root, ".argus", "testplans"));
+  let activated = 0;
+  for (const c of created) {
+    const pf = store.get(c.id);
+    if (!pf) continue; // plan removed after creation
+    if (pf.plan.status !== "DRAFT") continue; // never force a human's choice
+    store.write({ ...pf.plan, status: "ACTIVE" }, pf.body);
+    console.log(`  activated ${c.id} (DRAFT → ACTIVE)`);
+    activated++;
+  }
+  return activated;
 }
 
 function printSummary(summary: RunSummary, artifactDir: string): void {
@@ -229,6 +289,50 @@ export async function triageTargets(
       ),
     );
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Repair (argus fix)                                                   */
+/* ------------------------------------------------------------------ */
+
+/** Bug statuses the repair action still considers open. */
+export const OPEN_BUG_STATUSES = ["new", "confirmed", "unverified"] as const;
+
+/**
+ * bugs.jsonl is append-only: every status change appends a fresh row for the
+ * same bug_id. Collapse to one row per bug (last row wins) so counts and
+ * open/closed decisions reflect the current status, not the history.
+ */
+export function currentBugs(state: JsonlStateStore): BugRecord[] {
+  const latest = new Map<string, BugRecord>();
+  for (const b of state.bugs()) latest.set(b.bug_id, b);
+  return [...latest.values()];
+}
+
+/**
+ * Resolve the run `argus fix` should repair: the explicit `--run` id if
+ * given, otherwise the most recent run with at least one open bug. Returns
+ * null when nothing is repairable (no open bugs anywhere).
+ */
+export function findRepairRun(
+  root: string,
+  runId?: string,
+): string | null {
+  const state = new JsonlStateStore(path.join(root, ".argus", "state"));
+  const openRuns = new Set(
+    currentBugs(state)
+      .filter((b) => (OPEN_BUG_STATUSES as readonly string[]).includes(b.status))
+      .map((b) => b.run_id),
+  );
+  if (openRuns.size === 0) return null;
+  if (runId) {
+    return openRuns.has(runId) ? runId : null;
+  }
+  // lastRuns is append-ordered (oldest first) — walk newest to oldest.
+  for (const r of state.lastRuns(200).slice().reverse()) {
+    if (openRuns.has(r.run_id)) return r.run_id;
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ */

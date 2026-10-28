@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -8,9 +8,11 @@ import {
   planHistories,
   projectSummary,
   runDetail,
+  runProgress,
   resolveEvidence,
   verdictFor,
   openBugCount,
+  planCoverage,
   type RunSummaryJson,
 } from "./data.js";
 import type { BugRecord, RunRecord } from "@argus/core";
@@ -276,5 +278,124 @@ describe("resolveEvidence", () => {
     const r = resolveEvidence(repoPath, runId, "TP-999", "screenshot.png");
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.code).toBe(404);
+  });
+});
+
+describe("planCoverage", () => {
+  let repoPath: string;
+  let runId: string;
+
+  const load = () => ({
+    runs: readState(repoPath).runs,
+    plans: readPlans(repoPath),
+  });
+
+  const setImpact = (affected: unknown) =>
+    writeFileSync(
+      path.join(repoPath, ".argus", "runs", runId, "analyze", "impact.json"),
+      JSON.stringify({ affected, test_focus: [] }),
+    );
+
+  beforeEach(() => {
+    const f = makeFixtureRepo(dir);
+    repoPath = f.repo;
+    runId = f.runId;
+  });
+
+  it("covers impacted modules that have an ACTIVE plan (legacy string shape)", () => {
+    // fixture impact is `affected: ["auth"]`; TP-001 (auth) is ACTIVE
+    const cov = planCoverage(repoPath, load().runs, load().plans);
+    expect(cov).not.toBeNull();
+    expect(cov!.run_id).toBe(runId); // uses the terminal run, not the running one
+    expect(cov!.modules).toBe(1);
+    expect(cov!.covered).toEqual(["auth"]);
+    expect(cov!.uncovered).toEqual([]);
+  });
+
+  it("flags impacted modules with no ACTIVE plan as uncovered (current shape)", () => {
+    setImpact([
+      { module: "auth", risk: "high" },
+      { module: "billing", risk: "medium" },
+    ]);
+    const cov = planCoverage(repoPath, load().runs, load().plans);
+    expect(cov).not.toBeNull();
+    expect(cov!.modules).toBe(2);
+    expect(cov!.covered).toEqual(["auth"]);
+    expect(cov!.uncovered).toEqual([{ module: "billing", risk: "medium" }]);
+  });
+
+  it("returns null when no analyze artifact exists", () => {
+    rmSync(path.join(repoPath, ".argus", "runs", runId, "analyze"), { recursive: true, force: true });
+    const cov = planCoverage(repoPath, load().runs, load().plans);
+    expect(cov).toBe(null);
+  });
+});
+
+describe("runProgress", () => {
+  let repoPath: string;
+  let runId: string;
+  let runIdRunning: string;
+
+  beforeEach(() => {
+    const f = makeFixtureRepo(dir);
+    repoPath = f.repo;
+    runId = f.runId;
+    runIdRunning = f.runIdRunning;
+  });
+
+  it("marks the first unrecorded stage running for an in-flight run", () => {
+    const p = runProgress(repoPath, runIdRunning, null);
+    expect(p.run_id).toBe(runIdRunning);
+    expect(p.status).toBe("running");
+    expect(p.stages.map((s) => s.status)).toEqual([
+      "running",
+      "pending",
+      "pending",
+      "pending",
+      "pending",
+      "pending",
+    ]);
+    expect(p.progress).toBe(0);
+    expect(p.elapsed_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("reports full progress for a terminal run (done + skipped stages)", () => {
+    const p = runProgress(repoPath, runId, null);
+    expect(p.status).toBe("completed");
+    expect(p.stages.map((s) => s.status)).toEqual(["done", "done", "done", "done", "skipped", "skipped"]);
+    expect(p.progress).toBe(1);
+    // duration carries over from the stage records
+    const first = p.stages[0]!;
+    expect(first).toBeDefined();
+    expect(first.duration_ms).toBe(1000);
+  });
+
+  it("returns a defined shape for an unknown run", () => {
+    const p = runProgress(repoPath, "run-nope", null);
+    expect(p.status).toBe("unknown");
+    expect(p.stages).toEqual([]);
+    expect(p.progress).toBe(0);
+    expect(p.log_tail).toEqual([]);
+  });
+
+  it("tolerates a corrupt trailing line in stages.jsonl", () => {
+    const f = path.join(repoPath, ".argus", "state", "stages.jsonl");
+    writeFileSync(f, readFileSync(f, "utf8") + "not-json\n", { flag: "a" });
+    const p = runProgress(repoPath, runId, null);
+    expect(p.progress).toBe(1); // still fully parsed
+  });
+
+  it("returns a tail of the per-run trigger log when present", () => {
+    const logFile = path.join(dir, "trigger.log");
+    const lines = Array.from({ length: 50 }, (_, i) => `line-${i + 1}`);
+    writeFileSync(logFile, lines.join("\n") + "\n");
+    const p = runProgress(repoPath, runId, logFile, 10);
+    expect(p.log_file).toBe(logFile);
+    expect(p.log_tail).toEqual(lines.slice(-10));
+  });
+
+  it("returns an empty tail when the log file is missing", () => {
+    const p = runProgress(repoPath, runId, path.join(dir, "nope.log"));
+    expect(p.log_tail).toEqual([]);
   });
 });

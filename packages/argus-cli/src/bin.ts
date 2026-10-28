@@ -8,9 +8,11 @@
  *
  * Closed loop (each is a slice of the six-stage pipeline; see
  * src/pipeline.ts for the mapping):
- *   argus plan     analyze + testplan — draft test plans from the diff
- *   argus run      execute + triage   — run plans, report failures as bugs
- *   argus heal     all six stages     — full loop: detect → fix → verify → PR
+ *   argus plan      analyze + testplan       — draft test plans from the diff
+ *   argus run       execute + triage         — run plans, report failures as bugs
+ *   argus auto-run  plan + run in one        — draft plans, then run the suite
+ *   argus heal      all six stages           — full loop: detect → fix → verify → PR
+ *   argus fix       fixer + submit           — repair an existing run's open bugs
  *   argus triage   ad-hoc re-triage of an existing run's failures
  *   argus report   re-send the email report for an existing run
  *   argus inspect  print run/bug/scenario state
@@ -31,6 +33,8 @@ import {
   resendReport,
   inspect,
   allStages,
+  findRepairRun,
+  validateSeverities,
 } from "./pipeline.js";
 import { studioServe, studioAdd, studioRemove, studioList, studioOpen } from "./studio.js";
 
@@ -123,6 +127,19 @@ function pipelineOptions(cmd: Command): Command {
     .option("--no-har", "skip HAR capture");
 }
 
+/**
+ * Explicit run id for the run this command starts. Studio passes one so it
+ * can track exactly which run it spawned (e.g. to mark it `aborted` on stop).
+ */
+function runIdOption(cmd: Command): Command {
+  return cmd.option("--run-id <id>", "explicit run id for the new run (used by Studio for tracking)");
+}
+
+/** DRAFT → ACTIVE for the plans this run's testplan stage creates. */
+function activateOption(cmd: Command): Command {
+  return cmd.option("--activate", "activate DRAFT plans created by this run (DRAFT → ACTIVE)");
+}
+
 /** Shared action: run a stage slice, map errors → exit 1. */
 function pipelineAction(stages: AgentId[]) {
   return async (opts: {
@@ -133,6 +150,8 @@ function pipelineAction(stages: AgentId[]) {
     trace?: boolean;
     har?: boolean;
     plan?: string[];
+    runId?: string;
+    activate?: boolean;
   }) => {
     try {
       await executePipeline({
@@ -144,6 +163,8 @@ function pipelineAction(stages: AgentId[]) {
         noTrace: opts.trace === false,
         noHar: opts.har === false,
         plans: opts.plan,
+        runId: opts.runId,
+        activate: opts.activate,
       });
     } catch (e) {
       console.error(`error: ${(e as Error).message}`);
@@ -152,49 +173,140 @@ function pipelineAction(stages: AgentId[]) {
   };
 }
 
-program
+const planCmd = program
   .command("plan")
   .description("analyze the diff and draft test plans (stages: analyze, testplan)")
   .option("--repo <dir>", "target directory containing .argus/ (default: cwd)")
-  .option("-y, --yes", "bypass the testplan gate")
-  .action(async (opts: { repo?: string; yes?: boolean }) => {
-    try {
-      await executePipeline({
-        repo: path.resolve(opts.repo ?? process.cwd()),
-        stages: ["analyze", "testplan"],
-        yes: opts.yes,
-      });
-    } catch (e) {
-      console.error(`error: ${(e as Error).message}`);
-      process.exitCode = 1;
-    }
-  });
+  .option("-y, --yes", "bypass the testplan gate");
+runIdOption(activateOption(planCmd)).action(async (opts: {
+  repo?: string;
+  yes?: boolean;
+  activate?: boolean;
+  runId?: string;
+}) => {
+  try {
+    await executePipeline({
+      repo: path.resolve(opts.repo ?? process.cwd()),
+      stages: ["analyze", "testplan"],
+      yes: opts.yes,
+      activate: opts.activate,
+      runId: opts.runId,
+    });
+  } catch (e) {
+    console.error(`error: ${(e as Error).message}`);
+    process.exitCode = 1;
+  }
+});
 
-pipelineOptions(
+const runCmd = pipelineOptions(
   program
     .command("run")
     .description("run test plans and triage failures (stages: execute, triage)"),
-)
-  .option(
+);
+runIdOption(
+  runCmd.option(
     "--plan <id>",
     "only run this plan id (repeatable); ignores plan status",
     (v, prev: string[]) => [...(prev ?? []), v],
     [] as string[],
-  )
-  .action(pipelineAction(["execute", "triage"]));
+  ),
+).action(pipelineAction(["execute", "triage"]));
 
-pipelineOptions(
+const healCmd = pipelineOptions(
   program
     .command("heal")
     .description("full closed loop: analyze → plan → execute → triage → fix → submit"),
-)
-  .option(
+);
+runIdOption(
+  healCmd.option(
     "--plan <id>",
     "restrict execution to this plan id (repeatable)",
     (v, prev: string[]) => [...(prev ?? []), v],
     [] as string[],
+  ),
+).action(pipelineAction(allStages()));
+
+const autoRunCmd = pipelineOptions(
+  program
+    .command("auto-run")
+    .description(
+      "plan + run in one: draft plans from the diff, then execute all ACTIVE plans (stages: analyze, testplan, execute, triage) — no fixer",
+    ),
+);
+runIdOption(
+  activateOption(
+    autoRunCmd.option(
+      "--plan <id>",
+      "restrict execution to this plan id (repeatable)",
+      (v, prev: string[]) => [...(prev ?? []), v],
+      [] as string[],
+    ),
+  ),
+).action(pipelineAction(["analyze", "testplan", "execute", "triage"]));
+
+const fixCmd = program
+  .command("fix")
+  .description(
+    "repair mode: fix + verify + PR for an existing run's open bugs (stages: fixer, submit)",
   )
-  .action(pipelineAction(allStages()));
+  .option("--repo <dir>", "target directory containing .argus/ (default: cwd)")
+  .option("--run <runId>", "run to repair (default: most recent run with open bugs)")
+  .option("-y, --yes", "bypass human gates (CI)")
+  .option("--headful", "run the browser headed (dogfooding on a screen)")
+  .option("--no-video", "skip video capture")
+  .option("--no-trace", "skip trace capture")
+  .option("--no-har", "skip HAR capture")
+  .option(
+    "--severity <id>",
+    "severity to address, repeatable (default P0-Blocker, P1-High, P2-Medium)",
+    (v, prev: string[]) => [...(prev ?? []), v],
+    [] as string[],
+  );
+runIdOption(fixCmd).action(
+    async (opts: {
+      repo?: string;
+      run?: string;
+      runId?: string;
+      yes?: boolean;
+      headful?: boolean;
+      video?: boolean;
+      trace?: boolean;
+      har?: boolean;
+      severity: string[];
+    }) => {
+      try {
+        const root = path.resolve(opts.repo ?? process.cwd());
+        const srcRun = findRepairRun(root, opts.run);
+        if (!srcRun) {
+          console.log(
+            opts.run
+              ? `run ${opts.run} has no open bugs to fix`
+              : "no run with open bugs to fix — nothing to do",
+          );
+          return;
+        }
+        console.log(`repairing run ${srcRun} (${opts.severity.length ? opts.severity.join(", ") : "default P0–P2"} severities)…`);
+        await executePipeline({
+          repo: root,
+          stages: ["fixer", "submit"],
+          yes: opts.yes,
+          headful: opts.headful,
+          noVideo: opts.video === false,
+          noTrace: opts.trace === false,
+          noHar: opts.har === false,
+          repairRunId: srcRun,
+          runId: opts.runId,
+          // empty → undefined so the pipeline's P0–P2 default applies
+          allowedSeverities: opts.severity.length
+            ? validateSeverities(opts.severity)
+            : undefined,
+        });
+      } catch (e) {
+        console.error(`error: ${(e as Error).message}`);
+        process.exitCode = 1;
+      }
+    },
+  );
 
 program
   .command("triage")

@@ -5,10 +5,14 @@
  *         #/project/:name/runs/:runId     run (stages, scenarios, evidence)
  *
  * Live updates: 4s polling while the tab is visible; running runs pulse.
+ * While a pipeline run is in flight, the project view additionally polls
+ * the run's progress endpoint every 2 s and repaints the progress panel
+ * (stage chips, % bar, log tail) in place.
  */
 
 const STAGES = ["analyze", "testplan", "execute", "triage", "fixer", "submit"];
 const POLL_MS = 4000;
+const OPEN_BUG = new Set(["new", "confirmed", "unverified"]);
 
 /* ------------------------------------------------------------------ */
 /* utils                                                               */
@@ -82,13 +86,16 @@ async function api(method, path, body) {
 const app = {
   route: null,
   fleet: null, // { projects: [...] }
-  project: null, // { project, plans, plan_histories, runs, bugs }
+  project: null, // { project, plans, plan_histories, runs, bugs, active_run, coverage }
   run: null, // RunDetail
   runCache: new Map(), // runId -> RunDetail (for bug drawers)
   expandedScenarios: new Set(), // scenario keys expanded in run view
   expandedPlans: new Set(), // plan ids expanded in project view
   runFilter: "all",
   serverOk: null,
+  progress: null, // { runId, data: RunProgress } — last progress poll result
+  progressTimer: null, // 2s interval while a run is in flight
+  progressTarget: null, // { name, runId } the progress poll is watching
 };
 
 function evURL(name, runId, scenario, file) {
@@ -322,6 +329,68 @@ function renderBugsTable(scope = "project") {
   </div>`;
 }
 
+function progressPanel(act) {
+  const pr = app.progress && app.progress.runId === act.run_id ? app.progress.data : null;
+  const track = pr?.stages ?? [];
+  const chips = track
+    .map((s) => {
+      const mark = s.status === "done" ? "✓" : s.status === "skipped" ? "–" : s.status === "running" ? "▶" : "·";
+      const hint = s.duration_ms != null ? `${s.name} — ${dur(s.duration_ms)}` : `${s.name} — ${s.status}`;
+      return `<span class="stage-chip ${s.status}" title="${esc(hint)}"><span class="mark">${mark}</span><span class="name">${esc(s.name)}</span></span>`;
+    })
+    .join("");
+  const pct = pr ? Math.round((pr.progress ?? 0) * 100) : 0;
+  const tail =
+    pr && pr.log_tail?.length
+      ? `<pre class="ptail">${pr.log_tail.slice(-9).map((l) => (l.startsWith("#") ? `<span class="dimline">${esc(l)}</span>` : esc(l))).join("\n")}</pre>`
+      : "";
+  return `
+  <div class="pp-head">
+    <span class="pdot"></span>
+    <span class="pstat"><b>${esc(act.action)}</b> in progress · run <span class="mono">${esc(act.run_id)}</span>${act.source_run ? ` · fixing <span class="mono">${esc(act.source_run)}</span>` : ""}</span>
+    <span class="plog">${pr ? `${dur(pr.elapsed_ms)} elapsed · ${pct}% · ${pr.stages.filter((s) => s.status === "done").length}/${pr.stages.length} stages` : "starting — watching…"}</span>
+    <button class="btn danger small" data-action="pipeline-stop">⏹ Stop</button>
+  </div>
+  ${track.length ? `<div class="stage-track" aria-label="stage progress">${chips}</div>` : ""}
+  <div class="pbar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><div class="pbar-fill" style="width:${pct}%"></div></div>
+  ${tail}`;
+}
+
+function pipelineBar() {
+  const p = app.project.project;
+  const act = app.project.active_run;
+  const latest = p.latest;
+  if (act) {
+    return `<div class="pipeline-bar active" id="pbar" role="status">${progressPanel(act)}</div>`;
+  }
+  const disabled = !p.exists;
+  const btn = (action, label, hint) =>
+    `<button class="btn" data-action="pipeline" data-pipeline="${action}" ${disabled ? "disabled" : ""} title="${esc(hint)}">${label}</button>`;
+  let fixBtn = "";
+  if (latest && latest.verdict !== "running") {
+    const open = (app.project.bugs ?? []).filter((b) => b.run_id === latest.run_id && OPEN_BUG.has(b.status));
+    if (open.length)
+      fixBtn = `<button class="btn danger" data-action="fix-run" data-run="${esc(latest.run_id)}" title="fixer + verify + PR for ${open.length} open bug${open.length === 1 ? "" : "s"} in ${esc(latest.run_id)} (P0–P2)">🔧 Fix + verify + PR</button>`;
+  }
+  return `
+  <div class="pipeline-bar">
+    ${btn("plan", "Plan", "analyze the diff, draft new test plans, and activate them")}
+    ${btn("run", "Run", "execute every ACTIVE plan + triage failures")}
+    ${btn("auto-run", "Auto-run", "Plan, then Run, in one go")}
+    ${fixBtn}
+    <span class="plog">triggers run the built argus CLI on this machine</span>
+  </div>`;
+}
+
+function coverageChip() {
+  const cov = app.project.coverage;
+  if (!cov) return "";
+  if (cov.uncovered.length === 0)
+    return `<span class="chip ok" title="every impacted module has an ACTIVE plan">coverage ${cov.modules}/${cov.modules}</span>`;
+  const list = cov.uncovered.map((u) => `${u.module} (${u.risk})`).join("\n");
+  return `<span class="chip warn" title="impacted modules with no ACTIVE plan:\n${esc(list)}">coverage ${cov.modules - cov.uncovered.length}/${cov.modules} · ${cov.uncovered.length} uncovered</span>`;
+}
+
 function renderProject() {
   const proj = app.project;
   const p = proj.project;
@@ -330,9 +399,12 @@ function renderProject() {
     <h1 class="view-title">${esc(p.name)}</h1>
     ${p.latest ? badge(p.latest.verdict) : `<span class="badge neutral">never run</span>`}
     ${p.open_bugs ? `<span class="chip sev-P1">${p.open_bugs} open bug${p.open_bugs === 1 ? "" : "s"}</span>` : ""}
+    ${coverageChip()}
     ${!p.exists ? `<span class="badge fail">path gone</span>` : ""}
   </div>
   <div class="view-sub">${esc(p.path)}${p.latest ? ` · head ${esc(shortSha(p.latest.head))} · ${p.runs_total} run${p.runs_total === 1 ? "" : "s"}` : ""}</div>
+
+  ${pipelineBar()}
 
   <div class="section">
     <div class="section-head">
@@ -440,10 +512,16 @@ function renderRun() {
   const s = r.summary;
   const llm = r.llm_totals;
   const runDur = r.run.ended_at ? new Date(r.run.ended_at).getTime() - new Date(r.run.started_at).getTime() : null;
+  const openHere = r.bugs.filter((b) => OPEN_BUG.has(b.status));
+  const fixBtn =
+    r.verdict !== "running" && openHere.length
+      ? `<button class="btn danger" data-action="fix-run" data-run="${esc(r.run.run_id)}" title="fixer + verify + PR for ${openHere.length} open bug${openHere.length === 1 ? "" : "s"} in this run (P0–P2)">🔧 Fix + verify + PR</button>`
+      : "";
   return `
   <div class="view-head">
     <h1 class="view-title mono" style="font-size:17px">${esc(r.run.run_id)} <button class="copy-btn" data-action="copy" data-text="${esc(r.run.run_id)}" title="copy run id">⧉</button></h1>
     ${badge(r.verdict)}
+    ${fixBtn}
   </div>
   <div class="view-sub">
     ${relTime(r.run.started_at)} · ${dur(runDur)} · head ${esc(shortSha(r.head))} · config ${esc(r.config_hash.slice(0, 8))}${r.argus_version ? ` · argus ${esc(r.argus_version)}` : ""}
@@ -649,6 +727,7 @@ async function render() {
     main.scrollTop = scroll;
     app.serverOk = true;
     paintServerChip();
+    syncProgressPoll();
   } catch (e) {
     main.innerHTML = `<div class="errbox">${esc(e.message)}</div><p class="dim">the studio server may be unreachable, or this project is not registered.</p>`;
     app.serverOk = false;
@@ -669,6 +748,62 @@ setInterval(() => {
   if (document.visibilityState !== "visible") return;
   render().catch(() => {});
 }, POLL_MS);
+
+/*
+ * Progress fast-poll: while a pipeline run is in flight, the project view
+ * polls the progress endpoint every 2 s and repaints only the #pbar panel
+ * (stage chips, % bar, log tail) in place — no full re-render, so the view
+ * doesn't scroll-jump and the log updates feel live. Started/stopped by
+ * syncProgressPoll(), which render() calls on every pass.
+ */
+function syncProgressPoll() {
+  const onProject = app.route?.view === "project";
+  const act = onProject ? app.project?.active_run : null;
+  if (!act) {
+    stopProgressPoll();
+    return;
+  }
+  const target = { name: app.route.name, runId: act.run_id };
+  if (
+    app.progressTimer &&
+    app.progressTarget?.name === target.name &&
+    app.progressTarget?.runId === target.runId
+  )
+    return; // already watching this run
+  stopProgressPoll();
+  app.progressTarget = target;
+  app.progress = null;
+  const tick = () => {
+    if (document.visibilityState !== "visible") return; // matches the main poll
+    api(
+      "GET",
+      `/api/projects/${encodeURIComponent(target.name)}/runs/${encodeURIComponent(target.runId)}/progress`,
+    )
+      .then((data) => {
+        app.progress = { runId: target.runId, data };
+        paintProgress();
+      })
+      .catch(() => {
+        /* transient — keep the last paint; the 4s render will recover */
+      });
+  };
+  tick();
+  app.progressTimer = setInterval(tick, 2000);
+}
+
+function stopProgressPoll() {
+  if (app.progressTimer) clearInterval(app.progressTimer);
+  app.progressTimer = null;
+  app.progressTarget = null;
+  app.progress = null;
+}
+
+function paintProgress() {
+  const act = app.project?.active_run;
+  const el = $("#pbar");
+  if (!act || !el) return;
+  el.innerHTML = progressPanel(act);
+}
 
 /* ------------------------------------------------------------------ */
 /* global event handling (delegation — survives re-renders)            */
@@ -699,6 +834,49 @@ document.addEventListener("click", (e) => {
   if (a === "run-filter") {
     app.runFilter = t.dataset.filter;
     render().catch(() => {});
+    return;
+  }
+  if (a === "pipeline") {
+    e.preventDefault();
+    const name = app.route.name;
+    const action = t.dataset.pipeline;
+    api("POST", `/api/projects/${encodeURIComponent(name)}/pipeline`, { action })
+      .then((r) => {
+        toast(`${action} started — run ${r.run_id}`);
+        location.hash = `#/project/${encodeURIComponent(name)}`; // show the live progress panel
+        render().catch(() => {});
+      })
+      .catch((err) => toast(err.message, true));
+    return;
+  }
+  if (a === "pipeline-stop") {
+    e.preventDefault();
+    api("POST", `/api/projects/${encodeURIComponent(app.route.name)}/pipeline/stop`)
+      .then((r) => {
+        toast(`stopped ${r.run_id}`);
+        render().catch(() => {});
+      })
+      .catch((err) => toast(err.message, true));
+    return;
+  }
+  if (a === "fix-run") {
+    e.preventDefault();
+    const runId = t.dataset.run;
+    if (
+      !confirm(
+        `Start the fixer on run ${runId}'s open bugs?\n\n` +
+          "The fixer edits code on a branch, re-runs the failed scenarios, " +
+          "and opens a PR for each verified fix (P0–P2).",
+      )
+    )
+      return;
+    api("POST", `/api/projects/${encodeURIComponent(app.route.name)}/runs/${encodeURIComponent(runId)}/fix`, {})
+      .then((r) => {
+        toast(`fix started — ${r.open_bugs} open bug${r.open_bugs === 1 ? "" : "s"} → run ${r.run_id}`);
+        location.hash = `#/project/${encodeURIComponent(app.route.name)}`; // show the live progress panel
+        render().catch(() => {});
+      })
+      .catch((err) => toast(err.message, true));
     return;
   }
   if (a === "bug-open") {
