@@ -5,6 +5,9 @@
  *         #/project/:name/runs/:runId     run (stages, scenarios, evidence)
  *
  * Live updates: 4s polling while the tab is visible; running runs pulse.
+ * While a pipeline run is in flight, the project view additionally polls
+ * the run's progress endpoint every 2 s and repaints the progress panel
+ * (stage chips, % bar, log tail) in place.
  */
 
 const STAGES = ["analyze", "testplan", "execute", "triage", "fixer", "submit"];
@@ -83,13 +86,16 @@ async function api(method, path, body) {
 const app = {
   route: null,
   fleet: null, // { projects: [...] }
-  project: null, // { project, plans, plan_histories, runs, bugs }
+  project: null, // { project, plans, plan_histories, runs, bugs, active_run, coverage }
   run: null, // RunDetail
   runCache: new Map(), // runId -> RunDetail (for bug drawers)
   expandedScenarios: new Set(), // scenario keys expanded in run view
   expandedPlans: new Set(), // plan ids expanded in project view
   runFilter: "all",
   serverOk: null,
+  progress: null, // { runId, data: RunProgress } — last progress poll result
+  progressTimer: null, // 2s interval while a run is in flight
+  progressTarget: null, // { name, runId } the progress poll is watching
 };
 
 function evURL(name, runId, scenario, file) {
@@ -323,18 +329,39 @@ function renderBugsTable(scope = "project") {
   </div>`;
 }
 
+function progressPanel(act) {
+  const pr = app.progress && app.progress.runId === act.run_id ? app.progress.data : null;
+  const track = pr?.stages ?? [];
+  const chips = track
+    .map((s) => {
+      const mark = s.status === "done" ? "✓" : s.status === "skipped" ? "–" : s.status === "running" ? "▶" : "·";
+      const hint = s.duration_ms != null ? `${s.name} — ${dur(s.duration_ms)}` : `${s.name} — ${s.status}`;
+      return `<span class="stage-chip ${s.status}" title="${esc(hint)}"><span class="mark">${mark}</span><span class="name">${esc(s.name)}</span></span>`;
+    })
+    .join("");
+  const pct = pr ? Math.round((pr.progress ?? 0) * 100) : 0;
+  const tail =
+    pr && pr.log_tail?.length
+      ? `<pre class="ptail">${pr.log_tail.slice(-9).map((l) => (l.startsWith("#") ? `<span class="dimline">${esc(l)}</span>` : esc(l))).join("\n")}</pre>`
+      : "";
+  return `
+  <div class="pp-head">
+    <span class="pdot"></span>
+    <span class="pstat"><b>${esc(act.action)}</b> in progress · run <span class="mono">${esc(act.run_id)}</span>${act.source_run ? ` · fixing <span class="mono">${esc(act.source_run)}</span>` : ""}</span>
+    <span class="plog">${pr ? `${dur(pr.elapsed_ms)} elapsed · ${pct}% · ${pr.stages.filter((s) => s.status === "done").length}/${pr.stages.length} stages` : "starting — watching…"}</span>
+    <button class="btn danger small" data-action="pipeline-stop">⏹ Stop</button>
+  </div>
+  ${track.length ? `<div class="stage-track" aria-label="stage progress">${chips}</div>` : ""}
+  <div class="pbar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><div class="pbar-fill" style="width:${pct}%"></div></div>
+  ${tail}`;
+}
+
 function pipelineBar() {
   const p = app.project.project;
   const act = app.project.active_run;
   const latest = p.latest;
   if (act) {
-    return `
-    <div class="pipeline-bar active" role="status">
-      <span class="pdot"></span>
-      <span class="pstat">${esc(act.action)} in progress · run <span class="mono">${esc(act.run_id)}</span>${act.source_run ? ` · fixing <span class="mono">${esc(act.source_run)}</span>` : ""}</span>
-      <span class="plog">pid ${act.pid} · ${relTime(act.started_at)}</span>
-      <button class="btn danger small" data-action="pipeline-stop">⏹ Stop</button>
-    </div>`;
+    return `<div class="pipeline-bar active" id="pbar" role="status">${progressPanel(act)}</div>`;
   }
   const disabled = !p.exists;
   const btn = (action, label, hint) =>
@@ -700,6 +727,7 @@ async function render() {
     main.scrollTop = scroll;
     app.serverOk = true;
     paintServerChip();
+    syncProgressPoll();
   } catch (e) {
     main.innerHTML = `<div class="errbox">${esc(e.message)}</div><p class="dim">the studio server may be unreachable, or this project is not registered.</p>`;
     app.serverOk = false;
@@ -720,6 +748,62 @@ setInterval(() => {
   if (document.visibilityState !== "visible") return;
   render().catch(() => {});
 }, POLL_MS);
+
+/*
+ * Progress fast-poll: while a pipeline run is in flight, the project view
+ * polls the progress endpoint every 2 s and repaints only the #pbar panel
+ * (stage chips, % bar, log tail) in place — no full re-render, so the view
+ * doesn't scroll-jump and the log updates feel live. Started/stopped by
+ * syncProgressPoll(), which render() calls on every pass.
+ */
+function syncProgressPoll() {
+  const onProject = app.route?.view === "project";
+  const act = onProject ? app.project?.active_run : null;
+  if (!act) {
+    stopProgressPoll();
+    return;
+  }
+  const target = { name: app.route.name, runId: act.run_id };
+  if (
+    app.progressTimer &&
+    app.progressTarget?.name === target.name &&
+    app.progressTarget?.runId === target.runId
+  )
+    return; // already watching this run
+  stopProgressPoll();
+  app.progressTarget = target;
+  app.progress = null;
+  const tick = () => {
+    if (document.visibilityState !== "visible") return; // matches the main poll
+    api(
+      "GET",
+      `/api/projects/${encodeURIComponent(target.name)}/runs/${encodeURIComponent(target.runId)}/progress`,
+    )
+      .then((data) => {
+        app.progress = { runId: target.runId, data };
+        paintProgress();
+      })
+      .catch(() => {
+        /* transient — keep the last paint; the 4s render will recover */
+      });
+  };
+  tick();
+  app.progressTimer = setInterval(tick, 2000);
+}
+
+function stopProgressPoll() {
+  if (app.progressTimer) clearInterval(app.progressTimer);
+  app.progressTimer = null;
+  app.progressTarget = null;
+  app.progress = null;
+}
+
+function paintProgress() {
+  const act = app.project?.active_run;
+  const el = $("#pbar");
+  if (!act || !el) return;
+  el.innerHTML = progressPanel(act);
+}
 
 /* ------------------------------------------------------------------ */
 /* global event handling (delegation — survives re-renders)            */
@@ -759,6 +843,7 @@ document.addEventListener("click", (e) => {
     api("POST", `/api/projects/${encodeURIComponent(name)}/pipeline`, { action })
       .then((r) => {
         toast(`${action} started — run ${r.run_id}`);
+        location.hash = `#/project/${encodeURIComponent(name)}`; // show the live progress panel
         render().catch(() => {});
       })
       .catch((err) => toast(err.message, true));
@@ -788,6 +873,7 @@ document.addEventListener("click", (e) => {
     api("POST", `/api/projects/${encodeURIComponent(app.route.name)}/runs/${encodeURIComponent(runId)}/fix`, {})
       .then((r) => {
         toast(`fix started — ${r.open_bugs} open bug${r.open_bugs === 1 ? "" : "s"} → run ${r.run_id}`);
+        location.hash = `#/project/${encodeURIComponent(app.route.name)}`; // show the live progress panel
         render().catch(() => {});
       })
       .catch((err) => toast(err.message, true));

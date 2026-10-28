@@ -41,6 +41,7 @@ import {
   readPlans,
   readState,
   runDetail,
+  runProgress,
   resolveEvidence,
   readJsonSafe,
   EVIDENCE_CONTENT_TYPES,
@@ -52,6 +53,7 @@ import {
   type RunSummaryJson,
   type CoverageReport,
 } from "./data.js";
+import { buildId } from "./build.js";
 import { JsonlStateStore, newRunId } from "@argus/core";
 
 export interface StudioOptions {
@@ -178,8 +180,17 @@ export class StudioServer {
     const port = this.opts.port ?? 4900;
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => this.handle(req, res));
-      server.on("error", reject);
-      server.listen(port, host, () => resolve());
+      server.on("error", (e) => {
+        this.log(`studio: listen error on ${host}:${port}: ${e.message}`);
+        reject(e);
+      });
+      server.listen(port, host, () => {
+        this.log(
+          `studio: listening on http://${host}:${this.port} ` +
+            `(build ${buildId()}, registry ${this.registryDir()}, webRoot ${this.webRoot})`,
+        );
+        resolve();
+      });
       this.server = server;
     });
   }
@@ -205,7 +216,9 @@ export class StudioServer {
       }
     } catch (e) {
       const err = e as Error & { code?: number };
-      this.json(res, err.code ?? 500, { error: err.message });
+      const code = err.code ?? 500;
+      if (code >= 500) this.log(`request failed: ${req.method} ${req.url} → ${code} ${err.message}`);
+      this.json(res, code, { error: err.message });
     }
   }
 
@@ -228,7 +241,9 @@ export class StudioServer {
             r.fn(params, url, body, res, req.socket.remoteAddress);
           } catch (e) {
             const err = e as Error & { code?: number };
-            this.json(res, err.code ?? 500, { error: err.message });
+            const code = err.code ?? 500;
+            if (code >= 500) this.log(`request failed: ${method} ${url.pathname} → ${code} ${err.message}`);
+            this.json(res, code, { error: err.message });
           }
         });
         return;
@@ -380,6 +395,7 @@ export class StudioServer {
       }
       const runId = newRunId();
       const started = this.spawnPipeline(proj, action as PipelineAction, runId);
+      this.log(`pipeline: ${action} triggered for '${proj.name}' → run ${runId} (pid ${started.pid}, log ${started.logFile})`);
       this.json(res, 202, {
         action: action,
         run_id: runId,
@@ -431,6 +447,11 @@ export class StudioServer {
       }
       const runId = newRunId();
       const started = this.spawnPipeline(proj, "fix", runId, srcRun, severities);
+      this.log(
+        `pipeline: fix triggered for '${proj.name}' → run ${runId} ` +
+          `(${open.length} open bug${open.length === 1 ? "" : "s"} from ${srcRun}` +
+          `${severities.length ? `, severities ${severities.join(", ")}` : ""}, pid ${started.pid}, log ${started.logFile})`,
+      );
       this.json(res, 202, {
         action: "fix",
         run_id: runId,
@@ -455,6 +476,7 @@ export class StudioServer {
       if (!proj) throw this.err(404, `no project '${params.name}'`);
       const cur = this.active.get(proj.name);
       if (!cur) throw this.err(404, "no run in progress");
+      this.log(`pipeline: stop requested for '${proj.name}' run ${cur.runId} (action ${cur.action}, pid ${cur.pid})`);
       try {
         cur.child.kill("SIGTERM");
       } catch (e) {
@@ -497,6 +519,24 @@ export class StudioServer {
       this.json(res, 200, { run: detail });
     };
 
+    /**
+     * Live progress for a run: the ordered stage track, per-stage status,
+     * and a tail of the per-run trigger log. Cheap by design (reads only
+     * runs.jsonl + stages.jsonl + the log file), so the UI can poll it
+     * every couple of seconds while a run is in flight.
+     */
+    const runProgressRoute = (params: Record<string, string>, _u: URL, _b: string | null, res: http.ServerResponse) => {
+      const proj = this.findProject(params.name as string);
+      if (!proj) throw this.err(404, `no project '${params.name}'`);
+      const runId = params.runId as string;
+      const act = this.active.get(proj.name);
+      const logFile =
+        act && act.runId === runId
+          ? act.logFile
+          : path.join(this.registryDir(), "run-logs", `${proj.name}-${runId}.log`);
+      this.json(res, 200, runProgress(proj.path, runId, logFile, 30));
+    };
+
     const evidence = (
       params: Record<string, string>,
       url: URL,
@@ -526,7 +566,20 @@ export class StudioServer {
     };
 
     return [
-      { method: "GET", re: /^\/api\/health$/, params: [], fn: (_p, _u, _b, res) => this.json(res, 200, { ok: true, version: "0.1.0", projects: this.safeRegistry().projects.length + this.oneOff.length }) },
+      {
+        method: "GET",
+        re: /^\/api\/health$/,
+        params: [],
+        fn: (_p, _u, _b, res) =>
+          this.json(res, 200, {
+            ok: true,
+            version: "0.1.0",
+            // Lets `argus studio open` detect a server running older code
+            // (its build id no longer matches the installed files) and restart it.
+            build_id: buildId(),
+            projects: this.safeRegistry().projects.length + this.oneOff.length,
+          }),
+      },
       { method: "GET", re: /^\/api\/projects$/, params: [], fn: projects },
       { method: "POST", re: /^\/api\/projects$/, params: [], fn: addProject },
       { method: "DELETE", re: new RegExp(`^/api/projects/(${safeName})$`), params: ["name"], fn: removeProject },
@@ -536,6 +589,12 @@ export class StudioServer {
         re: new RegExp(`^/api/projects/(${safeName})/runs/([a-zA-Z0-9._-]+)$`),
         params: ["name", "runId"],
         fn: runRoute,
+      },
+      {
+        method: "GET",
+        re: new RegExp(`^/api/projects/(${safeName})/runs/([a-zA-Z0-9._-]+)/progress$`),
+        params: ["name", "runId"],
+        fn: runProgressRoute,
       },
       {
         method: "GET",

@@ -431,6 +431,61 @@ table.tbl { border-collapse: collapse; width: 100%; font-size: 13px; }
 .chip.ok { color: var(--green); border-color: rgba(95, 211, 154, 0.4); }
 .chip.warn { color: var(--amber); border-color: rgba(242, 182, 75, 0.4); }
 
+/* in-flight pipeline progress (live panel while a run is in progress) */
+.pipeline-bar.active { flex-direction: column; align-items: stretch; }
+.pipeline-bar.active .pp-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pipeline-bar.active .pp-head .btn.danger { margin-left: auto; }
+.stage-track { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.stage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font: 11px var(--mono);
+  color: var(--text-faint);
+}
+.stage-chip .mark { font-size: 10px; }
+.stage-chip.running {
+  border-color: rgba(86, 179, 196, 0.6);
+  color: var(--teal);
+  background: rgba(86, 179, 196, 0.08);
+}
+.stage-chip.running .mark { animation: pulse 1.1s ease-in-out infinite; }
+.stage-chip.done { border-color: rgba(95, 211, 154, 0.45); color: var(--green); background: var(--green-soft); }
+.stage-chip.skipped { opacity: 0.5; }
+.stage-chip.skipped .name { text-decoration: line-through; }
+.pbar {
+  margin-top: 10px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+}
+.pbar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--teal), var(--green));
+  transition: width 0.45s ease;
+}
+.ptail {
+  margin: 10px 0 0;
+  padding: 9px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-raised);
+  font: 11px/1.5 var(--mono);
+  color: var(--text-dim);
+  max-height: 132px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ptail .dimline { color: var(--text-faint); }
+
 /* ------------------------------------------------------------------ */
 /* run view                                                            */
 /* ------------------------------------------------------------------ */
@@ -704,6 +759,8 @@ details.diffbox pre { margin: 0; border: none; border-top: 1px solid var(--borde
 @media (prefers-reduced-motion: reduce) {
   .dot-pulse { animation: none; }
   .pipeline-bar .pdot { animation: none; }
+  .stage-chip.running .mark { animation: none; }
+  .pbar-fill { transition: none; }
   a.card:hover { transform: none; }
 }
 

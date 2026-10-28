@@ -479,6 +479,118 @@ export function runDetail(repoPath: string, runId: string): RunDetail | null {
 }
 
 /* ------------------------------------------------------------------ */
+/* run progress — for the in-flight pipeline bar                       */
+/* ------------------------------------------------------------------ */
+
+export type ProgressStageStatus = "pending" | "running" | "done" | "skipped";
+
+export interface ProgressStage {
+  name: string;
+  status: ProgressStageStatus;
+  duration_ms?: number;
+}
+
+export interface RunProgress {
+  run_id: string;
+  /** Run status: running | completed | failed | aborted | unknown. */
+  status: string;
+  started_at: string;
+  elapsed_ms: number;
+  /** The ordered stage track this action will run, with per-stage status. */
+  stages: ProgressStage[];
+  /** 0..1 — finished stages over the track length. */
+  progress: number;
+  /** Last N lines of the per-run trigger log (for the live "what's happening"). */
+  log_tail: string[];
+  log_file: string | null;
+}
+
+/** Tolerant one-file JSONL read (same shape as the state reader). */
+function readJsonl<T>(file: string): T[] {
+  if (!existsSync(file)) return [];
+  const out: T[] = [];
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      out.push(JSON.parse(t) as T);
+    } catch {
+      // corrupt / mid-write line — skip, never crash a progress poll
+    }
+  }
+  return out;
+}
+
+function readLogTail(file: string | null, n: number): string[] {
+  if (!file || !existsSync(file)) return [];
+  try {
+    const lines = readFileSync(file, "utf8").split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    return lines.slice(-n);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Progress snapshot for a run: the ordered stage track (from the run record —
+ * exactly the stages this action will run), which stages have finished (from
+ * the append-only stage records), and a tail of the trigger log. Light by
+ * design — it reads only `runs.jsonl` + `stages.jsonl` + the log file, so it
+ * is cheap enough for the 2 s progress poll.
+ */
+export function runProgress(
+  repoPath: string,
+  runId: string,
+  logFile: string | null,
+  lines = 30,
+): RunProgress {
+  const stateDir = path.join(repoPath, ".argus", "state");
+  const runs = readJsonl<RunRecord>(path.join(stateDir, "runs.jsonl")).filter(
+    (r) => r.run_id === runId,
+  );
+  const run = runs.at(-1) ?? null;
+  const track: string[] = run?.stages ?? [];
+  const done = new Map<string, { status: StageRecord["status"]; duration_ms?: number }>();
+  for (const s of readJsonl<StageRecord>(path.join(stateDir, "stages.jsonl")).filter(
+    (x) => x.run_id === runId,
+  )) {
+    done.set(s.stage, { status: s.status, duration_ms: s.duration_ms });
+  }
+
+  const status = run?.status ?? "unknown";
+  const isRunning = status === "running";
+  const firstOpen = track.findIndex((n) => !done.has(n));
+  const stages: ProgressStage[] = track.map((name, i) => {
+    const d = done.get(name);
+    if (d) {
+      return {
+        name,
+        status: d.status === "skipped" ? "skipped" : "done",
+        duration_ms: d.duration_ms,
+      };
+    }
+    return { name, status: isRunning && i === firstOpen ? "running" : "pending" };
+  });
+
+  const finished = stages.filter((s) => s.status === "done" || s.status === "skipped").length;
+  const progress = track.length ? finished / track.length : 0;
+  const startedAt = run?.started_at ?? "";
+  const elapsed_ms = startedAt ? Math.max(0, Date.now() - Date.parse(startedAt)) : 0;
+
+  return {
+    run_id: runId,
+    status,
+    started_at: startedAt,
+    elapsed_ms,
+    stages,
+    progress,
+    log_tail: readLogTail(logFile, lines),
+    log_file: logFile,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* evidence (artifact) access — guarded                                */
 /* ------------------------------------------------------------------ */
 

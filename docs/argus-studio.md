@@ -58,16 +58,27 @@ argus studio open
 Its behavior (implemented in `packages/argus-cli/src/studio.ts`,
 `studioOpen`):
 
-1. health-checks `http://127.0.0.1:4900/api/health` — if already healthy it
-   only opens the browser and exits (**idempotent**, safe to click repeatedly);
-2. otherwise it starts the server as a **detached daemon** — log and pid live
-   under the studio home (`~/.config/argus/studio.log`, `studio.pid`) — and
-   polls until healthy (15 s budget);
+1. health-checks `http://127.0.0.1:4900/api/health`. If a healthy server
+   answers, it compares the server's reported **build id** to the installed
+   build's fingerprint (`buildId()` in `packages/argus-studio/src/build.ts` —
+   a hash of the `dist/` runtime plus the served SPA assets):
+   - **same id** → only opens the browser and exits (**idempotent**, safe to
+     click repeatedly);
+   - **different id, or a pre-fingerprint server** (no `build_id` in the
+     health body) → the in-memory server is running stale code. Since the
+     SPA is always served fresh from disk, a stale server shows the new
+     buttons while lacking the new routes ("no such API route"). The launcher
+     stops the old server (pid file first, then a `/proc` socket-listener
+     scan for servers started by hand) and starts a fresh one;
+2. if nothing healthy is on the port, it starts the server as a **detached
+   daemon** — log and pid live under the studio home
+   (`~/.config/argus/studio.log`, `studio.pid`) — and polls until healthy
+   (15 s budget);
 3. opens the dashboard in the browser, honoring a `$BROWSER` override, with
    the platform default (`xdg-open` / `open` / `start`) otherwise;
-4. on failure (port squatted, crash on startup) it exits non-zero and points
-   at the log. The browser is only ever opened once the dashboard is
-   actually reachable.
+4. on failure (port squatted, crash on startup, old server would not die) it
+   exits non-zero and points at the log. The browser is only ever opened once
+   the dashboard is actually reachable.
 
 To pin it natively on a desktop with `.desktop` support (GNOME et al.),
 install a launcher entry and add it to the dock favorites:
@@ -231,12 +242,13 @@ degrades to a defined unknown shape, not a 500.
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /api/health` | liveness + project count |
+| `GET /api/health` | liveness + project count + `build_id` (the installed build's fingerprint — the launcher compares it to the running server's id to detect a stale server) |
 | `GET /api/projects` | fleet: one `ProjectSummary` per project (+ `plan_histories`) |
 | `POST /api/projects` | `{ name, path }` → 201 `{ project }`; 400 on validation errors |
 | `DELETE /api/projects/:name` | unregister |
 | `GET /api/projects/:name` | project detail: summary, plans, per-plan histories, enriched runs (terminal runs get `plans_executed` / `failures` / `bug_count`), all bugs, `active_run` (the run this server is driving, or `null`), and `coverage` (impacted modules vs ACTIVE plans) |
 | `GET /api/projects/:name/runs/:runId` | full run bundle: stages, scenarios (steps, console/network errors, evidence flags, failed-step screenshot), bugs (report + PR record), LLM calls + totals, analyze (files/diff/impact), testplan output |
+| `GET /api/projects/:name/runs/:runId/progress` | live progress snapshot for the 2 s UI poll: the ordered stage track (from the run record), per-stage status (`pending` / `running` / `done` / `skipped`), `progress` (0..1), `elapsed_ms`, and a tail of the per-run trigger log. Light by design — reads only `runs.jsonl`, `stages.jsonl`, and the log file; degrades to a defined `unknown` shape, never a 500 |
 | `GET /api/projects/:name/runs/:runId/evidence?scenario=&file=` | artifact bytes (screenshot / fail-step / video / trace / HAR / console / bug report / PR record) |
 | `GET /api/projects/:name/plans` | parsed plans |
 | `POST /api/projects/:name/pipeline` | `{ action: "plan" \| "run" \| "auto-run" }` → 202 `{ action, run_id, pid, started_at, log_file }`; 409 if a run is already active, 404 unknown project, 400 bad action / missing `.argus`. **Loopback-only** (403 otherwise). |
@@ -254,13 +266,34 @@ directory. Any `..`, absolute path, or non-whitelisted name is rejected with
 400/404 before a single byte is read. The static host applies the same
 prefix guard.
 
+## Logging
+
+The server writes timestamped lines to its stdout — which is
+`~/.config/argus/studio.log` for the daemon started by `studio open` (the
+foreground `argus studio` prints the same lines to the console). It records:
+
+- startup (listen address, **build id**, registry dir, web root) and listen
+  errors;
+- every pipeline trigger (action, project, run id, pid, log file), stop, and
+  fix trigger, including spawn errors and child exit codes;
+- every 5xx request with method, path, and error.
+
+In-flight runs additionally stream their CLI stdout/stderr to a per-run log
+(`run-logs/<project>-<runId>.log` next to the registry file), which is what
+the progress panel tails.
+
 ## UX notes
 
 - **Live**: 4 s polling; in-progress runs pulse amber; relative timestamps.
 - **Pipeline bar**: Plan / Run / Auto-run always available; the 🔧 Fix button
-  appears only on runs with open bugs and confirms before it spends tokens;
-  while a run is in flight the bar shows its state and a **⏹ Stop** button.
+  appears only on runs with open bugs and confirms before it spends tokens.
   All triggers are loopback-only.
+- **Live progress**: while a run is in flight the bar becomes a progress
+  panel — stage chips (pending / running / done / skipped), a % bar,
+  elapsed time, and a scrolling tail of the per-run trigger log — and
+  triggers (and Fix) navigate to the project view so the panel is visible.
+  The panel polls `…/runs/:runId/progress` every 2 s and repaints itself in
+  place (no full re-render), layered on the 4 s fleet poll.
 - **PWA**: `manifest.webmanifest` + the top-bar **Install** button (via
   `beforeinstallprompt`) installs Studio as a browser app — the Argus-eye
   favicon (`favicon.svg`) shows in the browser tab. (A *native* taskbar pin

@@ -3,11 +3,14 @@ import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, mkdirSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { StudioServer, isLoopback } from "./server.js";
+import { buildId } from "./build.js";
 import { makeFixtureRepo, TINY_PNG } from "./fixtures.js";
 
 let root: string;
 let repo: string;
+let progRepo: string;
 let runId: string;
+let runIdRunning: string;
 let server: StudioServer;
 let base: string;
 
@@ -16,6 +19,11 @@ beforeAll(async () => {
   repo = path.join(root, "repo");
   const f = makeFixtureRepo(repo);
   runId = f.runId;
+  runIdRunning = f.runIdRunning;
+  // second fixture copy for the progress suite — the registry dedupes by path,
+  // so a second project pointing at the same dir would 400 the registry suite
+  progRepo = path.join(root, "prog");
+  makeFixtureRepo(progRepo);
   server = new StudioServer({ registryFile: path.join(root, "projects.json"), port: 0 });
   await server.start();
   base = `http://127.0.0.1:${server.port}`;
@@ -47,6 +55,76 @@ describe("health", () => {
     expect(status).toBe(200);
     expect(body.ok).toBe(true);
     expect(typeof body.projects).toBe("number");
+  });
+
+  it("reports the installed build fingerprint (stale-server detection)", async () => {
+    const { status, body } = await req("GET", "/api/health");
+    expect(status).toBe(200);
+    expect(typeof body.build_id).toBe("string");
+    // the running server reports the same id the installed files hash to
+    expect(body.build_id).toBe(buildId());
+  });
+});
+
+describe("run progress", () => {
+  // Uses its own project name so this suite cannot collide with the registry
+  // suite (which asserts a fresh 201 for `repo` on the shared server).
+  const ensureProg = async () => {
+    const r = await req("POST", "/api/projects", { name: "prog", path: progRepo });
+    // 201 on first call, 400 (already registered) on repeat calls
+    expect([201, 400]).toContain(r.status);
+  };
+
+  it("reports the stage track + per-stage status for an in-flight run", async () => {
+    await ensureProg();
+    const { status, body } = await req("GET", `/api/projects/prog/runs/${runIdRunning}/progress`);
+    expect(status).toBe(200);
+    expect(body.run_id).toBe(runIdRunning);
+    expect(body.status).toBe("running");
+    expect(body.stages.map((s: any) => s.name)).toEqual([
+      "analyze",
+      "testplan",
+      "execute",
+      "triage",
+      "fixer",
+      "submit",
+    ]);
+    expect(body.stages.map((s: any) => s.status)).toEqual([
+      "running",
+      "pending",
+      "pending",
+      "pending",
+      "pending",
+      "pending",
+    ]);
+    expect(body.progress).toBe(0);
+    expect(Array.isArray(body.log_tail)).toBe(true);
+  });
+
+  it("reports 100% for a fully recorded terminal run", async () => {
+    await ensureProg();
+    const { status, body } = await req("GET", `/api/projects/prog/runs/${runId}/progress`);
+    expect(status).toBe(200);
+    expect(body.status).toBe("completed");
+    expect(body.progress).toBe(1);
+    expect(body.stages.map((s: any) => s.status)).toEqual(["done", "done", "done", "done", "skipped", "skipped"]);
+  });
+
+  it("includes a tail of the per-run trigger log when one exists", async () => {
+    await ensureProg();
+    // the server looks for trigger logs at <registryDir>/run-logs/<name>-<runId>.log
+    const logDir = path.join(root, "run-logs");
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(path.join(logDir, `prog-${runIdRunning}.log`), "step one\nstep two\nstep three\n");
+    const { status, body } = await req("GET", `/api/projects/prog/runs/${runIdRunning}/progress`);
+    expect(status).toBe(200);
+    expect(body.log_file).toContain(`prog-${runIdRunning}.log`);
+    expect(body.log_tail).toEqual(["step one", "step two", "step three"]);
+  });
+
+  it("404s for an unknown project", async () => {
+    const { status } = await req("GET", `/api/projects/nope/runs/${runId}/progress`);
+    expect(status).toBe(404);
   });
 });
 
